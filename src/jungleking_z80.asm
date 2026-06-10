@@ -1,8 +1,131 @@
+
+
+;	map(0x0000, 0x5fff).rom();
+;	map(0x6000, 0x7fff).bankr(m_mainbank);
+;	map(0x8000, 0x87ff).ram();
+;	map(0x8800, 0x8800).mirror(0x07fe).rw(FUNC(taitosj_state::fake_data_r), FUNC(taitosj_state::fake_data_w));
+;	map(0x8801, 0x8801).mirror(0x07fe).r(FUNC(taitosj_state::fake_status_r));
+;	map(0x9000, 0xbfff).w(FUNC(taitosj_state::characterram_w)).share(m_characterram);
+;	map(0xc000, 0xc3ff).ram();
+;	map(0xc400, 0xc7ff).ram().share(m_videoram[0]);
+;	map(0xc800, 0xcbff).ram().share(m_videoram[1]);
+;	map(0xcc00, 0xcfff).ram().share(m_videoram[2]);
+;	map(0xd000, 0xd05f).ram().share(m_colscrolly);
+;	map(0xd100, 0xd1ff).ram().share(m_spriteram);
+;	map(0xd200, 0xd27f).mirror(0x0080).ram().share(m_paletteram);
+;	map(0xd300, 0xd300).mirror(0x00ff).writeonly().share(m_video_priority);
+;	map(0xd400, 0xd403).mirror(0x00f0).readonly().share(m_collision_reg);
+;	map(0xd404, 0xd404).mirror(0x00f3).r(FUNC(taitosj_state::gfxrom_r));
+;	map(0xd408, 0xd408).mirror(0x00f0).portr("IN0");
+;	map(0xd409, 0xd409).mirror(0x00f0).portr("IN1");
+;	map(0xd40a, 0xd40a).mirror(0x00f0).portr("DSW1");
+;	map(0xd40b, 0xd40b).mirror(0x00f0).portr("IN2");
+;	map(0xd40c, 0xd40c).mirror(0x00f0).portr("IN3");          // Service
+;	map(0xd40d, 0xd40d).mirror(0x00f0).portr("IN4");
+;	map(0xd40e, 0xd40f).mirror(0x00f0).w(m_ay[0], FUNC(ay8910_device::address_data_w));
+;	map(0xd40f, 0xd40f).mirror(0x00f0).r(m_ay[0], FUNC(ay8910_device::data_r));   // DSW2 and DSW3
+;	map(0xd500, 0xd505).mirror(0x00f0).writeonly().share(m_scroll);
+;	map(0xd506, 0xd507).mirror(0x00f0).writeonly().share(m_colorbank);
+;	map(0xd508, 0xd508).mirror(0x00f0).w(FUNC(taitosj_state::collision_reg_clear_w));
+;	map(0xd509, 0xd50a).mirror(0x00f0).writeonly().share(m_gfxpointer);
+;	map(0xd50b, 0xd50b).mirror(0x00f0).w(FUNC(taitosj_state::soundlatch_w));
+;	map(0xd50c, 0xd50c).mirror(0x00f0).w(FUNC(taitosj_state::sound_semaphore2_w));
+;	map(0xd50d, 0xd50d).mirror(0x00f0).w("watchdog", FUNC(watchdog_timer_device::reset_w));
+;	map(0xd50e, 0xd50e).mirror(0x00f0).w(FUNC(taitosj_state::bankswitch_w));
+;	map(0xd50f, 0xd50f).mirror(0x00f0).nopw();
+;	map(0xd600, 0xd600).mirror(0x00ff).writeonly().share(m_video_mode);
+;	map(0xd700, 0xdfff).noprw();
+;	map(0xe000, 0xffff).rom();
+	
+;#define DSW2_PORT \
+;	PORT_DIPNAME( 0x0f, 0x00, DEF_STR( Coin_A ) )          PORT_DIPLOCATION("SWB:1,2,3,4") \
+;	PORT_DIPSETTING(    0x0f, DEF_STR( 9C_1C ) ) \
+;	PORT_DIPSETTING(    0x0e, DEF_STR( 8C_1C ) ) \
+;	PORT_DIPSETTING(    0x0d, DEF_STR( 7C_1C ) ) \
+;	PORT_DIPSETTING(    0x0c, DEF_STR( 6C_1C ) ) \
+;	PORT_DIPSETTING(    0x0b, DEF_STR( 5C_1C ) ) \
+;	PORT_DIPSETTING(    0x0a, DEF_STR( 4C_1C ) ) \
+;	PORT_DIPSETTING(    0x09, DEF_STR( 3C_1C ) ) \
+;	PORT_DIPSETTING(    0x08, DEF_STR( 2C_1C ) ) \
+;	PORT_DIPSETTING(    0x00, DEF_STR( 1C_1C ) ) \
+;	PORT_DIPSETTING(    0x01, DEF_STR( 1C_2C ) ) \
+;	PORT_DIPSETTING(    0x02, DEF_STR( 1C_3C ) ) \
+;	PORT_DIPSETTING(    0x03, DEF_STR( 1C_4C ) ) \
+;	PORT_DIPSETTING(    0x04, DEF_STR( 1C_5C ) ) \
+;	PORT_DIPSETTING(    0x05, DEF_STR( 1C_6C ) ) \
+;	PORT_DIPSETTING(    0x06, DEF_STR( 1C_7C ) ) \
+;	PORT_DIPSETTING(    0x07, DEF_STR( 1C_8C ) ) \
+;	PORT_DIPNAME( 0xf0, 0x00, DEF_STR( Coin_B ) )          PORT_DIPLOCATION("SWB:5,6,7,8") \
+;	PORT_DIPSETTING(    0xf0, DEF_STR( 9C_1C ) ) \
+;	PORT_DIPSETTING(    0xe0, DEF_STR( 8C_1C ) ) \
+;	PORT_DIPSETTING(    0xd0, DEF_STR( 7C_1C ) ) \
+;	PORT_DIPSETTING(    0xc0, DEF_STR( 6C_1C ) ) \
+;	PORT_DIPSETTING(    0xb0, DEF_STR( 5C_1C ) ) \
+;	PORT_DIPSETTING(    0xa0, DEF_STR( 4C_1C ) ) \
+;	PORT_DIPSETTING(    0x90, DEF_STR( 3C_1C ) ) \
+;	PORT_DIPSETTING(    0x80, DEF_STR( 2C_1C ) ) \
+;	PORT_DIPSETTING(    0x00, DEF_STR( 1C_1C ) ) \
+;	PORT_DIPSETTING(    0x10, DEF_STR( 1C_2C ) ) \
+;	PORT_DIPSETTING(    0x20, DEF_STR( 1C_3C ) ) \
+;	PORT_DIPSETTING(    0x30, DEF_STR( 1C_4C ) ) \
+;	PORT_DIPSETTING(    0x40, DEF_STR( 1C_5C ) ) \
+;	PORT_DIPSETTING(    0x50, DEF_STR( 1C_6C ) ) \
+;	PORT_DIPSETTING(    0x60, DEF_STR( 1C_7C ) ) \
+;	PORT_DIPSETTING(    0x70, DEF_STR( 1C_8C ) )
+;
+;#define COMMON_IN0\
+;	PORT_START("IN0")\
+;	PORT_BIT( 0x01, IP_ACTIVE_LOW, IPT_JOYSTICK_LEFT ) PORT_8WAY\
+;	PORT_BIT( 0x02, IP_ACTIVE_LOW, IPT_JOYSTICK_RIGHT ) PORT_8WAY\
+;	PORT_BIT( 0x04, IP_ACTIVE_LOW, IPT_JOYSTICK_DOWN ) PORT_8WAY\
+;	PORT_BIT( 0x08, IP_ACTIVE_LOW, IPT_JOYSTICK_UP ) PORT_8WAY\
+;	PORT_BIT( 0x10, IP_ACTIVE_LOW, IPT_BUTTON1 )\
+;	PORT_BIT( 0x20, IP_ACTIVE_LOW, IPT_BUTTON2 )\
+;	PORT_BIT( 0x40, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x80, IP_ACTIVE_LOW, IPT_UNKNOWN )
+;
+;#define COMMON_IN1\
+;	PORT_START("IN1")\
+;	PORT_BIT( 0x01, IP_ACTIVE_LOW, IPT_JOYSTICK_LEFT ) PORT_8WAY PORT_COCKTAIL\
+;	PORT_BIT( 0x02, IP_ACTIVE_LOW, IPT_JOYSTICK_RIGHT ) PORT_8WAY PORT_COCKTAIL\
+;	PORT_BIT( 0x04, IP_ACTIVE_LOW, IPT_JOYSTICK_DOWN ) PORT_8WAY PORT_COCKTAIL\
+;	PORT_BIT( 0x08, IP_ACTIVE_LOW, IPT_JOYSTICK_UP ) PORT_8WAY PORT_COCKTAIL\
+;	PORT_BIT( 0x10, IP_ACTIVE_LOW, IPT_BUTTON1 ) PORT_COCKTAIL\
+;	PORT_BIT( 0x20, IP_ACTIVE_LOW, IPT_BUTTON2 ) PORT_COCKTAIL\
+;	PORT_BIT( 0x40, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x80, IP_ACTIVE_LOW, IPT_UNKNOWN )
+;
+;#define COMMON_IN2\
+;	PORT_START("IN2")\
+;	PORT_BIT( 0x01, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x02, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x04, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x08, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x10, IP_ACTIVE_LOW, IPT_COIN2 )\
+;	PORT_BIT( 0x20, IP_ACTIVE_LOW, IPT_COIN1 )\
+;	PORT_BIT( 0x40, IP_ACTIVE_LOW, IPT_START1 )\
+;	PORT_BIT( 0x80, IP_ACTIVE_LOW, IPT_START2 )
+;
+;#define COMMON_IN3(coin3state)\
+;	PORT_START("IN3")      /* Service */\
+;	PORT_BIT( 0x01, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x02, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x04, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x08, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x10, coin3state, IPT_COIN3 )\
+;	PORT_BIT( 0x20, IP_ACTIVE_LOW, IPT_TILT )\
+;	PORT_BIT( 0x40, IP_ACTIVE_LOW, IPT_UNKNOWN )\
+;	PORT_BIT( 0x80, IP_ACTIVE_LOW, IPT_UNKNOWN )
+	
+irq_reentrancy_flag_8100 = $8100
+task_slot_cursor_8101 = $8101
+joy_port_1_d408 = $d408
+
 0000: 00          nop
 0001: 00          nop
 0002: 00          nop
-0003: F3          di
-0004: C3 08 03    jp   $0308
+0003: F3          di             ; disable interrupts
+0004: C3 08 03    jp   boot_0308     ; jump to cold boot
 0007: 00          nop
 0008: C3 C8 00    jp   $00C8
 000B: 00          nop
@@ -50,23 +173,23 @@
 0045: F5          push af
 0046: CD CD 0A    call $0ACD
 0049: CD 2B 09    call $092B
-004C: CD BA 0B    call $0BBA
+004C: CD BA 0B    call read_joystick_0bba
 004F: CD F6 0B    call $0BF6
 0052: 00          nop
 0053: 00          nop
 0054: 00          nop
-0055: 3A 00 81    ld   a,($8100)
+0055: 3A 00 81    ld   a,(irq_reentrancy_flag_8100)
 0058: A7          and  a
 0059: 20 10       jr   nz,$006B
 005B: 3E FF       ld   a,$FF
-005D: 32 00 81    ld   ($8100),a
+005D: 32 00 81    ld   (irq_reentrancy_flag_8100),a
 0060: FB          ei
 0061: CD 7B 00    call $007B
 0064: 00          nop
 0065: 00          nop
 0066: 00          nop
 0067: AF          xor  a
-0068: 32 00 81    ld   ($8100),a
+0068: 32 00 81    ld   (irq_reentrancy_flag_8100),a
 006B: F1          pop  af
 006C: E1          pop  hl
 006D: D1          pop  de
@@ -105,7 +228,7 @@
 00A0: 18 E1       jr   $0083
 00A2: E1          pop  hl
 00A3: F1          pop  af
-00A4: 32 01 81    ld   ($8101),a
+00A4: 32 01 81    ld   (task_slot_cursor_8101),a
 00A7: 21 B5 00    ld   hl,$00B5
 00AA: E5          push hl
 00AB: FD 4E 00    ld   c,(iy+$00)
@@ -114,7 +237,7 @@
 00B2: D5          push de
 00B3: D9          exx
 00B4: C9          ret
-00B5: 3A 01 81    ld   a,($8101)
+00B5: 3A 01 81    ld   a,(task_slot_cursor_8101)
 00B8: 3C          inc  a
 00B9: FE 10       cp   $10
 00BB: D0          ret  nc
@@ -455,21 +578,23 @@
 02FF: C3 E2 13    jp   $13E2
 0302: C3 8D 10    jp   $108D
 0305: C3 C0 10    jp   $10C0
-0308: ED 56       im   1
-030A: 21 00 80    ld   hl,$8000
+
+boot_0308:
+0308: ED 56       im   1            ; interrupt mode 1 (RST 38h on /INT)
+030A: 21 00 80    ld   hl,$8000     ; zero-fill all Work RAM ($8000–$87FF)
 030D: 36 00       ld   (hl),$00
 030F: 11 01 80    ld   de,$8001
 0312: 01 FF 07    ld   bc,$07FF
 0315: ED B0       ldir
-0317: 31 FE 87    ld   sp,$87FE
-031A: 06 00       ld   b,$00
-031C: CD D8 02    call $02D8
-031F: CD B8 07    call $07B8
-0322: CD CE 09    call $09CE
-0325: 3A 0A D4    ld   a,($D40A)
-0328: CB 6F       bit  5,a
-032A: C2 FA 0C    jp   nz,$0CFA
-032D: 3E 09       ld   a,$09
+0317: 31 FE 87    ld   sp,$87FE     ; stack at top of Work RAM
+031A: 06 00       ld   b,$00        ; call game_state_init_table (jp vector #0)
+031C: CD D8 02    call $02D8        ; decompress / upload GFX tile data to char RAM
+031F: CD B8 07    call $07B8        ; hardware init: AY sound, scroll regs, palette
+0322: CD CE 09    call $09CE        ; read DSW1
+0325: 3A 0A D4    ld   a,($D40A)    
+0328: CB 6F       bit  5,a          ; test "Cabinet type" dip switch
+032A: C2 FA 0C    jp   nz,$0CFA     ; attract / demo mode if set
+032D: 3E 09       ld   a,$09        ; set color bank
 032F: 32 06 D5    ld   ($D506),a
 0332: CD 8D 04    call $048D
 0335: 21 00 D0    ld   hl,$D000
@@ -687,6 +812,8 @@
 0495: 01 FF 03    ld   bc,$03FF
 0498: ED B0       ldir
 049A: 18 12       jr   $04AE
+
+update_scrolling_049c:
 049C: 21 80 C4    ld   hl,$C480
 049F: 36 FF       ld   (hl),$FF
 04A1: 11 81 C4    ld   de,$C481
@@ -697,6 +824,7 @@
 04AE: 06 10       ld   b,$10
 04B0: CD D8 02    call $02D8
 04B3: C9          ret
+
 04B4: CD 8D 04    call $048D
 04B7: CD F1 04    call $04F1
 04BA: 3A 6A 81    ld   a,($816A)
@@ -773,7 +901,7 @@
 0546: 12          ld   (de),a
 0547: 1D          dec  e
 0548: 27          daa
-0549: CD 9C 04    call $049C
+0549: CD 9C 04    call update_scrolling_049c
 054C: 21 68 C5    ld   hl,$C568
 054F: 11 BA 05    ld   de,$05BA
 0552: 0E 01       ld   c,$01
@@ -1251,6 +1379,7 @@
 08C3: 32 0E D4    ld   ($D40E),a
 08C6: 3A 0F D4    ld   a,($D40F)
 08C9: C9          ret
+
 08CA: 21 5E 81    ld   hl,$815E
 08CD: 36 00       ld   (hl),$00
 08CF: 11 5F 81    ld   de,$815F
@@ -1626,10 +1755,12 @@
 0BB6: 06 00       ld   b,$00
 0BB8: 09          add  hl,bc
 0BB9: C9          ret
+
+read_joystick_0bba:
 0BBA: 3A 2B 84    ld   a,($842B)
 0BBD: A7          and  a
 0BBE: C0          ret  nz
-0BBF: 21 08 D4    ld   hl,$D408
+0BBF: 21 08 D4    ld   hl,joy_port_1_d408
 0BC2: 3A 59 81    ld   a,($8159)
 0BC5: A7          and  a
 0BC6: 28 03       jr   z,$0BCB
@@ -1637,6 +1768,7 @@
 0BCB: 7E          ld   a,(hl)
 0BCC: 32 D8 81    ld   ($81D8),a
 0BCF: C9          ret
+
 0BD0: 3E C3       ld   a,$C3
 0BD2: 32 42 84    ld   ($8442),a
 0BD5: 21 07 3F    ld   hl,$3F07
@@ -1655,9 +1787,11 @@
 0BF2: C2 EC 0B    jp   nz,$0BEC
 0BF5: C9          ret
 0BF6: CD B0 0C    call $0CB0
-0BF9: CD 00 0C    call $0C00
+0BF9: CD 00 0C    call music_sequencer_0c00
 0BFC: CD A9 0C    call $0CA9
 0BFF: C9          ret
+
+music_sequencer_0c00:
 0C00: 21 45 84    ld   hl,$8445
 0C03: 35          dec  (hl)
 0C04: CB 46       bit  0,(hl)
@@ -1948,7 +2082,7 @@
 0E50: D7          rst  $10
 0E51: 3E 01       ld   a,$01
 0E53: F7          rst  $30
-0E54: CD 9C 04    call $049C
+0E54: CD 9C 04    call update_scrolling_049c
 0E57: 21 35 84    ld   hl,$8435
 0E5A: 11 27 84    ld   de,$8427
 0E5D: CD 84 0B    call $0B84
@@ -2188,7 +2322,7 @@
 1023: A7          and  a
 1024: C2 AA 0F    jp   nz,$0FAA
 1027: CD 8C 0B    call $0B8C
-102A: CD 9C 04    call $049C
+102A: CD 9C 04    call update_scrolling_049c
 102D: 06 03       ld   b,$03
 102F: CD 74 08    call $0874
 1032: 21 8B C5    ld   hl,$C58B
@@ -2197,7 +2331,7 @@
 103A: CD D5 02    call $02D5
 103D: 3E 7E       ld   a,$7E
 103F: F7          rst  $30
-1040: CD 9C 04    call $049C
+1040: CD 9C 04    call update_scrolling_049c
 1043: 3E 03       ld   a,$03
 1045: 32 56 81    ld   ($8156),a
 1048: CD 0F 0A    call $0A0F
