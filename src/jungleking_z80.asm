@@ -120,6 +120,7 @@
 irq_reentrancy_flag_8100 = $8100
 task_slot_cursor_8101 = $8101
 joy_port_1_d408 = $d408
+stack_save_8104 = $8104
 
 0000: 00          nop
 0001: 00          nop
@@ -233,7 +234,7 @@ joy_port_1_d408 = $d408
 00AA: E5          push hl
 00AB: FD 4E 00    ld   c,(iy+$00)
 00AE: D9          exx
-00AF: CD 96 02    call $0296
+00AF: CD 96 02    call task_resume_0296
 00B2: D5          push de
 00B3: D9          exx
 00B4: C9          ret
@@ -248,7 +249,7 @@ joy_port_1_d408 = $d408
 00C4: 10 FA       djnz $00C0
 00C6: 18 B7       jr   $007F
 
-00C8: CD 36 02    call $0236
+00C8: CD 36 02    call switch_context_0236
 00CB: C5          push bc
 00CC: FD E5       push iy
 00CE: CD 0F 02    call $020F
@@ -283,7 +284,7 @@ joy_port_1_d408 = $d408
 0102: ED B0       ldir
 0104: 21 0E 01    ld   hl,$010E
 0107: E5          push hl
-0108: CD 96 02    call $0296
+0108: CD 96 02    call task_resume_0296
 010B: D5          push de
 010C: D9          exx
 010D: C9          ret
@@ -299,7 +300,7 @@ joy_port_1_d408 = $d408
 011D: 10 FA       djnz $0119
 011F: D0          ret  nc
 0120: D9          exx
-0121: CD 96 02    call $0296
+0121: CD 96 02    call task_resume_0296
 0124: D5          push de
 0125: D9          exx
 0126: C9          ret
@@ -312,7 +313,7 @@ joy_port_1_d408 = $d408
 012D: DD E1       pop  ix
 012F: FD E1       pop  iy
 0131: C9          ret
-0132: CD 36 02    call $0236
+0132: CD 36 02    call switch_context_0236
 0135: FD 7E 03    ld   a,(iy+$03)
 0138: B9          cp   c
 0139: 20 0B       jr   nz,$0146
@@ -335,11 +336,11 @@ joy_port_1_d408 = $d408
 015E: 3C          inc  a
 015F: 28 C6       jr   z,$0127
 0161: D9          exx
-0162: CD 96 02    call $0296
+0162: CD 96 02    call task_resume_0296
 0165: D5          push de
 0166: D9          exx
 0167: C9          ret
-0168: CD 36 02    call $0236
+0168: CD 36 02    call switch_context_0236
 016B: 79          ld   a,c
 016C: 3C          inc  a
 016D: 28 17       jr   z,$0186
@@ -353,14 +354,14 @@ joy_port_1_d408 = $d408
 017B: 67          ld   h,a
 017C: 22 02 81    ld   ($8102),hl
 017F: D9          exx
-0180: CD 96 02    call $0296
+0180: CD 96 02    call task_resume_0296
 0183: D5          push de
 0184: D9          exx
 0185: C9          ret
 0186: 21 00 00    ld   hl,$0000
 0189: 22 02 81    ld   ($8102),hl
 018C: 18 99       jr   $0127
-018E: CD 36 02    call $0236
+018E: CD 36 02    call switch_context_0236
 0191: C5          push bc
 0192: FD E5       push iy
 0194: FD 5E 03    ld   e,(iy+$03)
@@ -388,7 +389,7 @@ joy_port_1_d408 = $d408
 01BF: 10 FA       djnz $01BB
 01C1: D0          ret  nc
 01C2: D9          exx
-01C3: CD 96 02    call $0296
+01C3: CD 96 02    call task_resume_0296
 01C6: D5          push de
 01C7: D9          exx
 01C8: C9          ret
@@ -409,7 +410,7 @@ joy_port_1_d408 = $d408
 01E3: E5          push hl
 01E4: FD 4E 00    ld   c,(iy+$00)
 01E7: D9          exx
-01E8: CD 96 02    call $0296
+01E8: CD 96 02    call task_resume_0296
 01EB: D5          push de
 01EC: D9          exx
 01ED: C9          ret
@@ -418,13 +419,13 @@ joy_port_1_d408 = $d408
 01F1: E1          pop  hl
 01F2: F1          pop  af
 01F3: 18 AC       jr   $01A1
-01F5: CD 36 02    call $0236
+01F5: CD 36 02    call switch_context_0236
 01F8: 79          ld   a,c
 01F9: 3C          inc  a
 01FA: CA 00 00    jp   z,$0000
 01FD: FD 36 01 20 ld   (iy+$01),$20
 0201: C9          ret
-0202: CD 36 02    call $0236
+0202: CD 36 02    call switch_context_0236
 0205: 79          ld   a,c
 0206: 3C          inc  a
 0207: CC 00 00    call z,$0000
@@ -454,17 +455,18 @@ joy_port_1_d408 = $d408
 0232: 22 02 81    ld   ($8102),hl
 0235: C9          ret
 
+switch_context_0236:
 0236: 08          ex   af,af'
 0237: D9          exx
-0238: E1          pop  hl
+0238: E1          pop  hl		; hl contains return value
 0239: 79          ld   a,c
 023A: 3C          inc  a
-023B: 28 2F       jr   z,$026C
-023D: E3          ex   (sp),hl
-023E: EB          ex   de,hl
+023B: 28 2F       jr   z,save_registers_and_jump_026c		; if c == $ff jump
+023D: E3          ex   (sp),hl		; put return value in current stack
+023E: EB          ex   de,hl		; and contents of current stack in de
 023F: 21 00 00    ld   hl,$0000
-0242: 39          add  hl,sp
-0243: 22 04 81    ld   ($8104),hl
+0242: 39          add  hl,sp		; save stack value
+0243: 22 04 81    ld   (stack_save_8104),hl
 0246: FD E5       push iy
 0248: CD 7E 02    call $027E
 024B: EB          ex   de,hl
@@ -484,12 +486,13 @@ joy_port_1_d408 = $d408
 025E: F5          push af
 025F: FD 21 FE FF ld   iy,$FFFE
 0263: FD 39       add  iy,sp
-0265: 2A 04 81    ld   hl,($8104)
+0265: 2A 04 81    ld   hl,(stack_save_8104)
 0268: F9          ld   sp,hl
 0269: D9          exx
 026A: FB          ei
 026B: C9          ret
 
+save_registers_and_jump_026c:
 026C: 08          ex   af,af'
 026D: D9          exx
 026E: FD E5       push iy
@@ -500,8 +503,9 @@ joy_port_1_d408 = $d408
 0275: F5          push af
 0276: D9          exx
 0277: FD 21 FE FF ld   iy,$FFFE
-027B: FD 39       add  iy,sp
-027D: E9          jp   (hl)
+027B: FD 39       add  iy,sp		; iy = sp-2
+027D: E9          jp   (hl)			; jump to hl
+
 027E: 06 00       ld   b,$00
 0280: 21 06 81    ld   hl,$8106
 0283: 09          add  hl,bc
@@ -519,9 +523,11 @@ joy_port_1_d408 = $d408
 0292: FD E1       pop  iy
 0294: C1          pop  bc
 0295: C9          ret
+
+task_resume_0296:
 0296: 21 00 00    ld   hl,$0000
-0299: 39          add  hl,sp
-029A: 22 04 81    ld   ($8104),hl
+0299: 39          add  hl,sp		; copy sp value in hl
+029A: 22 04 81    ld   (stack_save_8104),hl	; store sp value in memory
 029D: FD 23       inc  iy
 029F: FD 23       inc  iy
 02A1: F3          di
@@ -534,10 +540,11 @@ joy_port_1_d408 = $d408
 02AA: FD E1       pop  iy
 02AC: D9          exx
 02AD: D1          pop  de
-02AE: 2A 04 81    ld   hl,($8104)
+02AE: 2A 04 81    ld   hl,(stack_save_8104)
 02B1: F9          ld   sp,hl
 02B2: FB          ei
 02B3: C9          ret
+
 02B4: 21 01 00    ld   hl,$0001
 02B7: 04          inc  b
 02B8: 05          dec  b
@@ -545,6 +552,7 @@ joy_port_1_d408 = $d408
 02BA: 29          add  hl,hl
 02BB: 10 FD       djnz $02BA
 02BD: C9          ret
+
 02BE: CD B4 02    call $02B4
 02C1: ED 5B 02 81 ld   de,($8102)
 02C5: 7D          ld   a,l
@@ -6130,7 +6138,7 @@ music_sequencer_0c00:
 3107: 22 90 84    ld   ($8490),hl
 310A: 3E FE       ld   a,$FE
 310C: 32 93 84    ld   ($8493),a
-310F: 21 6C 02    ld   hl,$026C
+310F: 21 6C 02    ld   hl,save_registers_and_jump_026c
 3112: 22 71 85    ld   ($8571),hl
 3115: 3E 04       ld   a,$04
 3117: 32 94 84    ld   ($8494),a
