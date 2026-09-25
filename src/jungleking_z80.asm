@@ -1,4 +1,117 @@
-
+;=============================================================================
+; JUNGLE KING (Taito, 1982) - main CPU (Z80) - annotated disassembly
+; MAME driver: taito/taitosj.cpp, set "junglek" (no MCU, screen ROT180)
+; Address format of the labels: <description>_<hex address in lower case>.
+; All original addresses / bytes are kept unchanged.
+;=============================================================================
+;
+; ROMS / MEMORY
+;  $0000-$5FFF  program ROM kn21-1, kn22-1, kn43, kn24, kn25, kn46
+;  $6000-$7FFF  banked (D50E bit 7): bank 0 = kn47 ($6000) + kn28 ($7000)
+;               bank 1 = (nothing at $6000) + kn60 ($7000). Bank 1 is only
+;               selected inside the IRQ while the AY#0 effect sequencer runs.
+;               Important tables in kn28: $7900 palette, $7D36 palettes per
+;               stage, $7F40 initial $D500-$D50F values, $7F4F stage task
+;               IDs [level], $7F52 stage graphics sources [level],
+;               $7F60 TASK ADDRESS TABLE (2 bytes per task ID).
+;  $8000-$87FF  work RAM (see equates below)
+;  $9000-$BFFF  character generator RAM (loaded from the graphics ROMs,
+;               read through $D509/$D50A + $D404)
+;  $C400-$CFFF  3 tilemap layers (layer 1 = $C400 texts/scores, layers 2/3
+;               = scrolling backgrounds $C800/$CC00)
+;
+; HARDWARE HABITS OF THIS CODE
+;  - Video RAM and character RAM are always written TWICE ("ld (hl),a /
+;    ld (hl),a"). Only one write is needed on another platform.
+;  - Sprites: 4 bytes X, Y, attr (b0 flipx, b1 flipy, b2 colour), code
+;    (b0-5, b6 bank). HW sprites $10-$17 do not exist, this is why the
+;    shadow $83BB is copied in two parts ($D100 and $D160).
+;  - Text tiles: $00-$09 digits, $0A-$23 = A-Z, $27 '-', $2B (c), $FF space.
+;    Strings printed by print_string_slow_040e start with a length byte.
+;  - Sound: commands to the sound CPU are written to $D50B (music / most
+;    sounds); a few simple effects are played on AY#0 by the main CPU
+;    (ay0_sfx_sequencer_0c00). DSW2/DSW3 are read through AY#0 ports.
+;  - The Z80 R register is used as a random number (3CEA).
+;
+;=============================================================================
+; THE TASK KERNEL (cooperative multitasking) - READ THIS BEFORE PORTING
+;=============================================================================
+;  Everything runs in the VBLANK IRQ (irq_vblank_0038). The main program
+;  (main_start_0cfa) is an idle loop. The IRQ first updates the hardware and
+;  then calls the scheduler (task_scheduler_007b) with interrupts enabled.
+;
+;  TCB (task control block): 16 slots x 16 bytes at $8000:
+;    +0 task ID   +1 status ($80 created, $40 sleeping, $20 waiting event,
+;    $00 free)   +2 F  +3 A (= sleep counter / event number)  +4 BC
+;    +6 DE  +8 HL  +A IX  +C IY  +E/+F resume PC
+;  $8102 = 16-bit bitmap of used slots, $8106[ID] = slot of task ID.
+;  C' (alternate C register) = ID of the running task, $FF = not a task.
+;
+;  RST 08  spawn task A        (child inherits ALL registers, runs at once)
+;  RST 10  kill task A         (A = own ID: never returns)
+;  RST 18  kill all other tasks
+;  RST 20  wait for event A    (yield until an RST 28 with the same A)
+;  RST 28  signal event A      (waiting tasks run immediately; returns
+;                               A=$FF if somebody was woken, else 0)
+;  RST 30  sleep A frames      (A=0 -> 256 frames). Normal "end of frame".
+;
+;  PORTING PITFALLS
+;  1. The kernel saves registers + PC only, NOT the stack. Tasks share one
+;     stack and must yield with nothing of their own pushed on it.
+;     print_string_slow_040e yields from inside a subroutine by popping its
+;     return addresses into IX/IY (saved in the TCB). Easiest on 68000:
+;     implement the kernel natively with one small stack per task
+;     (coroutines) - then any yield point works.
+;  2. Parameters are passed to tasks through inherited registers
+;     (task 7: HL/BC, stage tasks: B = player, C = round, F.Z = fresh
+;     start, see 0E7F-0EB9). The child runs before the parent continues.
+;  3. "exx / ld a,c / exx / rst $10" = kill myself (reads C').
+;  4. task03_bonus_timer_105c sets C'=2 and jumps into task 2's game over
+;     code: it impersonates task 2 (1075).
+;  5. RST 20/30 from the non-task context resets the machine (C'=$FF).
+;  6. Spawning an ID that already runs remaps the ID to the new TCB.
+;  7. Self-modified RAM jumps: $8442 (AY#0 sequencer state),
+;     $8496/$8499/$849C (stage 3 call-backs), JP (IX) state machines (3E29).
+;
+;  TASK ID -> ENTRY POINT (the real table is at $7F60 in kn28.bin, file
+;  offset $0F60, not disassembled here). IDs $00-$16 are certain (linear
+;  vector tables); the others are deduced from the spawn/kill patterns and
+;  are all consistent, but please confirm with a dump of $7F60.
+;   00 task00_attract_0d19            01 task01_wait_start_0df1
+;   02 task02_game_flow_0e51          03 task03_bonus_timer_105c
+;   04 task04_scroll_117c             05 task05_sprite_positions_13e2
+;   06 task06_award_pending_score_108d 07 task07_load_stage_gfx_10c0
+;  stage 1 (vines):
+;   08 init 14ed  09 scroll follow 170c  0A/0B/0C vine anims 1751/179a/17e2
+;   0D vine grab 18cf  0E fall check 1a90  0F stage clear 1abf
+;   10 jump button 1b20  11 player path 1b8c  12 end zone 1c17
+;   13 monkey 1c38  14 life lost 1d4b  15 landing 1d87  16 hold timeout 1f00
+;  stage 2 (river):
+;   1C delayed stab 2571  1D stab hit 25f8  1E dive 2518  1F rise 2542
+;   20 init 2042  21 control 22c8  22 air 26cd  23 death 274e  24 stab 2587
+;   25 world 27f9  2A forward 2230  2B back 227e  2C drift 21da
+;   2D idle 256c  2E objects 2b7b
+;  stage 3 (hill, boulders):
+;   28 init 3033  29 stage end 33ba  30 start 3147  31 input 3312
+;   32 boulders 344b  33 player 316a  34 hill scroll 3401
+;   35 boulder collision 382b  36 hilltop 39f6  37 death 39ab
+;   49 final jump 5805  4A player sfx 3963
+;  stage 4 (cannibals, rescue) + ending:
+;   38 init 3b79  39 scene 3c37  3A cannibal hit 3e94  3B rescue 3f44
+;   3C hazard hit 3f82  3D dance 7300  3E jump button 7330  3F jump 738d
+;   40 resolve 74b7  41 walk 7575  42 death anim 7538  43 spear 7603
+;   44 ending 3b2a  45 sprite align 77a0
+;  Events: $00 stage over (-> task 2, $8434 = $FF died / $00 cleared),
+;          $07 graphics loaded, $69 ending synchronisation.
+;
+; GAME FLOW
+;  boot_0308 -> system_init_09ce -> main_start_0cfa (spawns task 0)
+;  task 0 attract/demo  -> task 1 waits for credits/start -> task 2 game
+;  flow: for each life: task 7 loads stage graphics, stage init task
+;  ($08/$20/$28/$38) spawns the stage tasks, the stage ends with event 0,
+;  task 2 kills everything (RST 18) and goes on (next stage / next life /
+;  game over -> task 0).
+;=============================================================================
 
 ;	map(0x0000, 0x5fff).rom();
 ;	map(0x6000, 0x7fff).bankr(m_mainbank);
@@ -36,7 +149,7 @@
 ;	map(0xd600, 0xd600).mirror(0x00ff).writeonly().share(m_video_mode);
 ;	map(0xd700, 0xdfff).noprw();
 ;	map(0xe000, 0xffff).rom();
-	
+
 ;#define DSW2_PORT \
 ;	PORT_DIPNAME( 0x0f, 0x00, DEF_STR( Coin_A ) )          PORT_DIPLOCATION("SWB:1,2,3,4") \
 ;	PORT_DIPSETTING(    0x0f, DEF_STR( 9C_1C ) ) \
@@ -116,50 +229,171 @@
 ;	PORT_BIT( 0x20, IP_ACTIVE_LOW, IPT_TILT )\
 ;	PORT_BIT( 0x40, IP_ACTIVE_LOW, IPT_UNKNOWN )\
 ;	PORT_BIT( 0x80, IP_ACTIVE_LOW, IPT_UNKNOWN )
-	
-irq_reentrancy_flag_8100 = $8100
-task_slot_cursor_8101 = $8101
-joy_port_1_d408 = $d408
-stack_save_8104 = $8104
 
+;-------------------------------------------------------------- RAM / HW equates
+tcb_table_8000 = $8000                      ; 16 task control blocks x 16 bytes ($8000-$80FF)
+irq_reentrancy_flag_8100 = $8100            ; $FF while the scheduler runs inside the IRQ
+task_slot_cursor_8101 = $8101               ; slot (0-15) being processed by the scheduler
+task_slot_mask_8102 = $8102                 ; 16-bit bitmap of allocated TCB slots
+stack_save_8104 = $8104                     ; kernel SP save while swapping to a TCB
+task_id_to_slot_8106 = $8106                ; task ID -> TCB slot table (IDs $00-$4F)
+cur_player_8156 = $8156                     ; $03 = player 1 playing, $00 = player 2
+flip_bits_8157 = $8157                      ; current screen flip bits (0 or 3)
+dsw_flip_8158 = $8158                       ; 3 when DSW1 flip-screen dip is OFF (normal orientation)
+dsw_cocktail_8159 = $8159                   ; 3 when cabinet = cocktail
+dsw_finish_bonus_815a = $815A               ; 0=none 1=timer x1 2=x2 3=x3
+dsw_lives_815b = $815B                      ; 0..3 -> 3,4,5,6 lives
+dsw_lives_limited_815c = $815C              ; 0 = infinite lives ("FREE GAME", no timer)
+dsw_year_display_815d = $815D               ; 1 = show year in copyright line
+coin3_latch_815e = $815E                    ; service coin edge latch
+coin1_latch_815f = $815F                    ; coin A edge latch, +1 count, +2 coins/credit, +3 credits/coin
+coin2_latch_8163 = $8163                    ; coin B edge latch, +1 count, +2 coins/credit, +3 credits/coin
+dsw_coin_b_enabled_8167 = $8167             ; 1 = coin slot B enabled
+bank_latch_shadow_8168 = $8168              ; shadow of $D50E (b0 coin enable, b1 sound on, b7 ROM bank)
+credits_8169 = $8169                        ; credits (BCD, max 9)
+two_player_game_816a = $816A                ; 1 = 2 player game
+hiscore_816b = $816B                        ; high score, 3 bytes BCD, LSB first
+p1_score_816e = $816E                       ; player 1 score, 3 bytes BCD, LSB first
+p2_score_8171 = $8171                       ; player 2 score, 3 bytes BCD, LSB first
+pending_score_ticks_8174 = $8174            ; number of +10 point ticks still to award (1 per frame)
+colscroll_l1_8175 = $8175                   ; layer 1 column scroll shadow (32)
+colscroll_l2_8195 = $8195                   ; layer 2 column scroll shadow (32, rotated by one)
+colscroll_l3_81b5 = $81B5                   ; layer 3 column scroll shadow (32)
+colorbank_shadow_81d5 = $81D5               ; shadow of $D506/$D507
+video_mode_shadow_81d7 = $81D7              ; shadow of $D600
+joystick_input_81d8 = $81D8                 ; current controls (active low) - replaced by the demo script in attract mode
+bg_attr_l2_81f9 = $81F9                     ; 4 x 32 attribute bytes of layer 2 (collision / ground info)
+bg_attr_l3_8279 = $8279                     ; 4 x 32 attribute bytes of layer 3
+scroll_logical_82f9 = $82F9                 ; x/y logical scroll of layers 1,2,3 (6 bytes)
+scroll_l2_x_82fb = $82FB                    ; layer 2 logical x scroll
+scroll_hw_shadow_82ff = $82FF               ; hardware scroll registers shadow -> $D500-$D505
+column_buffer_8305 = $8305                  ; new tile column for layer 2 (32) + layer 3 (32)
+scroll_speed_8345 = $8345                   ; requested scroll speed (signed, 1/8 px units)
+scroll_frac_8346 = $8346                    ; scroll sub-pixel accumulator
+scroll_phase_8347 = $8347                   ; 0..3 frame phase used by the speed table
+layer_scroll_state_8348 = $8348             ; L2/L3 map streaming state, interleaved (+0 speed, +2/+4 map ptr, +6/+8 column ptr, +A repeat, +C column, +E/+10 distance)
+bg_column_l2_8354 = $8354                   ; next column index (0-31) to redraw, layer 2
+bg_column_l3_8355 = $8355                   ; next column index (0-31) to redraw, layer 3
+distance_hi_8356 = $8356                    ; scrolled distance hi (L2,L3)
+distance_lo_8358 = $8358                    ; scrolled distance lo (L2,L3)
+scroll_mode_835a = $835A                    ; $FF = scroll/column drawing off, b7 = column drawing paused, 0/2/4 = stage specific modes
+object_pos_835b = $835B                     ; 24 logical sprite positions x 4 bytes (x_hi, x, y_hi, y)
+sprite_shadow_83bb = $83BB                  ; 24 hardware sprites x 4 bytes (X, Y, attr, code) -> $D100
+sprite_adjust_841b = $841B                  ; +1 / -1 sprite offset depending on flip
+colscroll_dirty_841c = $841C                ; 3 flags: upload column scroll of layer 1/2/3 at next vblank
+palette_upload_841f = $841F                 ; $FF = upload palette at next vblank ($8420 count, $8421 dest, $8423 src)
+lives_8425 = $8425                          ; lives P1 ($8425) / P2 ($8426), $FF = infinite
+level_8427 = $8427                          ; stage 1-4 for P1 ($8427) / P2 ($8428)
+round_8429 = $8429                          ; loop / difficulty 1-4 for P1 ($8429) / P2 ($842A)
+attract_mode_842b = $842B                   ; non zero = attract / demo mode (inputs ignored)
+attract_phase_842c = $842C                  ; 0 = demo play, else title sequence
+timer_period_842d = $842D                   ; frames between two -10 steps of the bonus timer
+bonus_timer_842e = $842E                    ; bonus timer P1 ($842E-$8430) / P2 ($8431-$8433), BCD
+player_died_8434 = $8434                    ; $FF = life lost, $00 = stage cleared (read by task 2)
+died_flag_8435 = $8435                      ; per player ($8435/$8436): restart from checkpoint
+surface_anim_ptr_8437 = $8437               ; big-endian ptr to 64 tiles copied to $CD00 every frame (stage 2)
+demo_script_ptr_8439 = $8439                ; attract mode demo input script pointer
+ay0_sfx_request_843b = $843B                ; $80 stop, $81/$82 start AY#0 effect 1/2
+ay0_sfx_jp_8442 = $8442                     ; RAM "JP nnnn" : $C3 + state handler address ($8443)
+sfx_frame_toggle_8445 = $8445               ; AY#0 sequencer runs every 2nd frame
+bonus_life_flags_844b = $844B               ; b0-1 bonus life setting, b7 P1 awarded, b6 P2 awarded
+status_line_8458 = $8458                    ; 12 tiles copied to $C4B1 each frame (stage 2 air meter)
+colscroll_d000 = $D000                      ; column scroll RAM (3 x 32)
+spriteram_d100 = $D100                      ; sprite RAM
+paletteram_d200 = $D200                     ; palette RAM
+priority_d300 = $D300                       ; layer priority
+gfxrom_data_d404 = $D404                    ; read graphics ROM at address set in $D509/$D50A
+joy_port_1_d408 = $D408                     ; IN0 player 1 controls
+joy_port_2_d409 = $D409                     ; IN1 player 2 controls (cocktail)
+dsw1_d40a = $D40A                           ; DSW1
+in2_coin_start_d40b = $D40B                 ; IN2 coins / starts
+in3_service_d40c = $D40C                    ; IN3 service coin / tilt
+ay0_addr_d40e = $D40E                       ; AY-3-8910 #0 register select
+ay0_data_d40f = $D40F                       ; AY-3-8910 #0 data (ports = DSW2 / DSW3)
+scroll_regs_d500 = $D500                    ; layer scroll registers (6)
+colorbank_d506 = $D506                      ; color bank registers (2)
+gfxrom_addr_d509 = $D509                    ; graphics ROM read address (2)
+sound_cmd_d50b = $D50B                      ; command to the sound CPU
+sound_semaphore_d50c = $D50C                ; EPORT2 bit to the sound CPU
+watchdog_d50d = $D50D                       ; watchdog reset
+bank_coinlock_d50e = $D50E                  ; b0 coin enable, b1 sound on, b7 ROM bank at $6000
+video_mode_d600 = $D600                     ; b0/b1 flip, b4-b6 layer enables, b7 sprites enable
+
+;----------------------------------------------------------------------------
+; RESET. Jumps to the cold boot. The RST 08..30 vectors below are the entry
+; points of the cooperative multitasking kernel (see file header).
+;----------------------------------------------------------------------------
+reset_0000:
 0000: 00          nop
 0001: 00          nop
 0002: 00          nop
-0003: F3          di             ; disable interrupts
-0004: C3 08 03    jp   boot_0308     ; jump to cold boot
+0003: F3          di                        ; disable interrupts
+0004: C3 08 03    jp   boot_0308            ; jump to cold boot
 0007: 00          nop
-0008: C3 C8 00    jp   $00C8
+
+rst08_vector_0008:
+0008: C3 C8 00    jp   rst08_task_spawn_00c8  ; RST 08 spawn task A
 000B: 00          nop
 000C: 00          nop
 000D: 00          nop
 000E: 00          nop
 000F: 00          nop
-0010: C3 32 01    jp   $0132
+
+rst10_vector_0010:
+0010: C3 32 01    jp   rst10_task_kill_0132 ; RST 10 kill task A
 0013: 00          nop
 0014: 00          nop
 0015: 00          nop
 0016: 00          nop
 0017: 00          nop
-0018: C3 68 01    jp   $0168
+
+rst18_vector_0018:
+0018: C3 68 01    jp   rst18_kill_other_tasks_0168  ; RST 18 kill all other tasks
 001B: 00          nop
 001C: 00          nop
 001D: 00          nop
 001E: 00          nop
 001F: 00          nop
-0020: C3 F5 01    jp   $01F5
+
+rst20_vector_0020:
+0020: C3 F5 01    jp   rst20_wait_event_01f5  ; RST 20 wait for event A
 0023: 00          nop
 0024: 00          nop
 0025: 00          nop
 0026: 00          nop
 0027: 00          nop
-0028: C3 8E 01    jp   $018E
-002B: C3 67 08    jp   $0867
+
+rst28_vector_0028:
+0028: C3 8E 01    jp   rst28_signal_event_018e  ; RST 28 signal event A
+
+vector_set_video_enable_002b:
+002B: C3 67 08    jp   set_video_enable_0867  ; (not an RST) vector: set video enable
 002E: 00          nop
 002F: 00          nop
-0030: C3 02 02    jp   $0202
-0033: C3 4A 13    jp   $134A
+
+rst30_vector_0030:
+0030: C3 02 02    jp   rst30_task_sleep_0202  ; RST 30 sleep A frames
+
+vector_init_scrolling_map_0033:
+0033: C3 4A 13    jp   init_scrolling_map_134a  ; (not an RST) vector: init scrolling map
 0036: 00          nop
 0037: 00          nop
+
+;----------------------------------------------------------------------------
+; IRQ (RST 38, IM 1) = VBLANK interrupt, 60 Hz.
+;  1) saves ALL registers (main + alternate set + IX/IY)
+;  2) hardware updates that must happen every frame:
+;     irq_video_update_0acd  (scroll regs, sprites, column scroll, palette, bg columns)
+;     irq_coin_handler_092b  (coins, tilt, bank latch)
+;     read_joystick_0bba     (controls -> $81D8)
+;     irq_sound_update_0bf6  (on-board AY#0 effects, ROM bank 1 selected meanwhile)
+;  3) runs the task scheduler WITH INTERRUPTS RE-ENABLED. If the scheduler is
+;     still running when the next IRQ comes, only step 2 is done (flag $8100):
+;     tasks never run re-entrantly, a slow frame just delays the tasks.
+; ALL game logic runs inside this interrupt (in tasks). The main program
+; (main_start_0cfa) is an empty idle loop.
+;----------------------------------------------------------------------------
+irq_vblank_0038:
 0038: FD E5       push iy
 003A: DD E5       push ix
 003C: C5          push bc
@@ -172,20 +406,20 @@ stack_save_8104 = $8104
 0043: D5          push de
 0044: E5          push hl
 0045: F5          push af
-0046: CD CD 0A    call $0ACD
-0049: CD 2B 09    call $092B
+0046: CD CD 0A    call irq_video_update_0acd
+0049: CD 2B 09    call irq_coin_handler_092b
 004C: CD BA 0B    call read_joystick_0bba
-004F: CD F6 0B    call $0BF6
+004F: CD F6 0B    call irq_sound_update_0bf6
 0052: 00          nop
 0053: 00          nop
 0054: 00          nop
-0055: 3A 00 81    ld   a,(irq_reentrancy_flag_8100)
+0055: 3A 00 81    ld   a,(irq_reentrancy_flag_8100)  ; scheduler already running (previous frame overran) ?
 0058: A7          and  a
 0059: 20 10       jr   nz,$006B
-005B: 3E FF       ld   a,$FF
+005B: 3E FF       ld   a,$FF                ; mark running
 005D: 32 00 81    ld   (irq_reentrancy_flag_8100),a
-0060: FB          ei
-0061: CD 7B 00    call $007B
+0060: FB          ei                        ; tasks run with interrupts enabled
+0061: CD 7B 00    call task_scheduler_007b
 0064: 00          nop
 0065: 00          nop
 0066: 00          nop
@@ -206,8 +440,19 @@ stack_save_8104 = $8104
 0079: FB          ei
 007A: C9          ret
 
+;----------------------------------------------------------------------------
+; Task scheduler. Walks slots 0..15 in the allocation bitmap $8102.
+; For every slot whose TCB status has bit 6 (sleeping) set, decrements the
+; sleep counter (TCB+3 = saved A register). When it reaches 0 the task is
+; resumed at its saved PC, with $00B5 pushed as return address: when the
+; task yields again (RST 20/30 handler does a RET) execution comes back to
+; $00B5 which continues the scan with the next slot.
+; Tasks in status $80 (just created) or $20 (waiting for an event) are NOT
+; run by the scheduler.
+;----------------------------------------------------------------------------
+task_scheduler_007b:
 007B: AF          xor  a
-007C: 2A 02 81    ld   hl,($8102)
+007C: 2A 02 81    ld   hl,(task_slot_mask_8102)  ; HL = slot bitmap
 007F: CB 45       bit  0,l
 0081: 20 0A       jr   nz,$008D
 0083: 3C          inc  a
@@ -219,57 +464,73 @@ stack_save_8104 = $8104
 008D: F5          push af
 008E: E5          push hl
 008F: 6F          ld   l,a
-0090: CD 86 02    call $0286
-0093: FD CB 01 76 bit  6,(iy+$01)
+0090: CD 86 02    call get_tcb_by_slot_l_0286  ; IY = TCB of slot A
+0093: FD CB 01 76 bit  6,(iy+$01)           ; status bit 6 = sleeping ?
 0097: 28 05       jr   z,$009E
-0099: FD 35 03    dec  (iy+$03)
+0099: FD 35 03    dec  (iy+$03)             ; TCB+3 (saved A) = sleep counter
 009C: 28 04       jr   z,$00A2
 009E: E1          pop  hl
 009F: F1          pop  af
 00A0: 18 E1       jr   $0083
 00A2: E1          pop  hl
 00A3: F1          pop  af
-00A4: 32 01 81    ld   (task_slot_cursor_8101),a
-00A7: 21 B5 00    ld   hl,$00B5
+00A4: 32 01 81    ld   (task_slot_cursor_8101),a  ; remember current slot
+00A7: 21 B5 00    ld   hl,scheduler_next_slot_00b5  ; task will return (yield) to $00B5
 00AA: E5          push hl
-00AB: FD 4E 00    ld   c,(iy+$00)
+00AB: FD 4E 00    ld   c,(iy+$00)           ; C = task ID -> goes to C' (the running task ID)
 00AE: D9          exx
-00AF: CD 96 02    call task_resume_0296
-00B2: D5          push de
+00AF: CD 96 02    call task_resume_0296     ; restore task registers, DE = task PC
+00B2: D5          push de                   ; jump into the task
 00B3: D9          exx
 00B4: C9          ret
-00B5: 3A 01 81    ld   a,(task_slot_cursor_8101)
+
+scheduler_next_slot_00b5:
+00B5: 3A 01 81    ld   a,(task_slot_cursor_8101)  ; back from a task: next slot
 00B8: 3C          inc  a
 00B9: FE 10       cp   $10
 00BB: D0          ret  nc
-00BC: 2A 02 81    ld   hl,($8102)
+00BC: 2A 02 81    ld   hl,(task_slot_mask_8102)
 00BF: 47          ld   b,a
 00C0: CB 1C       rr   h
 00C2: CB 1D       rr   l
 00C4: 10 FA       djnz $00C0
 00C6: 18 B7       jr   $007F
 
+;----------------------------------------------------------------------------
+; RST 08 : SPAWN TASK.  in: A = task ID (00..4F)
+;  - allocates a free TCB slot (resets the machine if none: jp $0000)
+;  - $8106[ID] = slot, TCB+0 = ID, TCB+1 = $80, TCB+E/F = entry address read
+;    from the task address table at $7F60 + 2*ID (in the banked ROM kn28!)
+;  - THE CHILD INHERITS ALL THE PARENT REGISTERS (AF,BC,DE,HL,IX,IY): this is
+;    how parameters are passed to tasks (e.g. task 7 gets HL/BC, the stage
+;    tasks get B = player, C = round, F.Z = fresh start).
+;  - the child is run IMMEDIATELY until its first yield, then the parent is
+;    resumed (unless the child killed it -> back to the scheduler).
+;  - can be called from the non-task context (C'=$FF): then it returns
+;    normally to the caller.
+;----------------------------------------------------------------------------
+rst08_task_spawn_00c8:
 00C8: CD 36 02    call switch_context_0236
 00CB: C5          push bc
 00CC: FD E5       push iy
-00CE: CD 0F 02    call $020F
-00D1: FD 5E 03    ld   e,(iy+$03)
+00CE: CD 0F 02    call alloc_task_slot_020f ; B = new slot
+00D1: FD 5E 03    ld   e,(iy+$03)           ; E = new task ID (caller A)
 00D4: 16 00       ld   d,$00
-00D6: 21 06 81    ld   hl,$8106
+00D6: 21 06 81    ld   hl,task_id_to_slot_8106
 00D9: 19          add  hl,de
-00DA: 70          ld   (hl),b
+00DA: 70          ld   (hl),b               ; task_id_to_slot[ID] = slot
 00DB: 4B          ld   c,e
 00DC: EB          ex   de,hl
 00DD: 29          add  hl,hl
-00DE: 11 60 7F    ld   de,$7F60
+00DE: 11 60 7F    ld   de,$7F60             ; task address table in banked ROM kn28
 00E1: 19          add  hl,de
 00E2: 5E          ld   e,(hl)
 00E3: 23          inc  hl
 00E4: 56          ld   d,(hl)
-00E5: CD 85 02    call $0285
-00E8: FD 71 00    ld   (iy+$00),c
-00EB: FD 36 01 80 ld   (iy+$01),$80
-00EF: FD 73 0E    ld   (iy+$0e),e
+00E5: CD 85 02    call get_tcb_by_slot_b_0285
+00E8: FD 71 00    ld   (iy+$00),c           ; TCB+0 = ID
+00EB: FD 36 01 80 ld   (iy+$01),$80         ; TCB+1 = $80 created
+00EF: FD 73 0E    ld   (iy+$0e),e           ; TCB+E/F = entry PC
 00F2: FD 72 0F    ld   (iy+$0f),d
 00F5: D9          exx
 00F6: FD E5       push iy
@@ -280,30 +541,38 @@ stack_save_8104 = $8104
 00FC: E5          push hl
 00FD: 23          inc  hl
 00FE: 23          inc  hl
-00FF: 01 0C 00    ld   bc,$000C
+00FF: 01 0C 00    ld   bc,$000C             ; child inherits the parent registers (12 bytes)
 0102: ED B0       ldir
-0104: 21 0E 01    ld   hl,$010E
+0104: 21 0E 01    ld   hl,spawn_child_yielded_010e  ; return here when the child yields
 0107: E5          push hl
-0108: CD 96 02    call task_resume_0296
+0108: CD 96 02    call task_resume_0296     ; run the child NOW
 010B: D5          push de
 010C: D9          exx
 010D: C9          ret
+
+spawn_child_yielded_010e:
 010E: FD E1       pop  iy
 0110: C1          pop  bc
-0111: 79          ld   a,c
+0111: 79          ld   a,c                  ; parent = non-task ?
 0112: 3C          inc  a
-0113: 28 12       jr   z,$0127
-0115: 2A 02 81    ld   hl,($8102)
+0113: 28 12       jr   z,kernel_return_to_nontask_0127
+0115: 2A 02 81    ld   hl,(task_slot_mask_8102)
 0118: 04          inc  b
 0119: CB 1C       rr   h
 011B: CB 1D       rr   l
 011D: 10 FA       djnz $0119
-011F: D0          ret  nc
+011F: D0          ret  nc                   ; parent killed by the child -> back to scheduler
 0120: D9          exx
-0121: CD 96 02    call task_resume_0296
+0121: CD 96 02    call task_resume_0296     ; resume the parent
 0124: D5          push de
 0125: D9          exx
 0126: C9          ret
+
+;----------------------------------------------------------------------------
+; Return to the non-task caller: restores the registers pushed by
+; save_registers_and_jump_026c and returns.
+;----------------------------------------------------------------------------
+kernel_return_to_nontask_0127:
 0127: 08          ex   af,af'
 0128: D9          exx
 0129: F1          pop  af
@@ -313,61 +582,87 @@ stack_save_8104 = $8104
 012D: DD E1       pop  ix
 012F: FD E1       pop  iy
 0131: C9          ret
+
+;----------------------------------------------------------------------------
+; RST 10 : KILL TASK.  in: A = task ID to kill.
+;  - A = own ID : the TCB is freed and control goes back to the scheduler
+;    (never returns). The idiom "exx / ld a,c / exx / rst $10" = kill myself
+;    (C' always holds the ID of the running task).
+;  - other ID : frees its TCB if the ID is still mapped to a live TCB, then
+;    the caller continues.
+;----------------------------------------------------------------------------
+rst10_task_kill_0132:
 0132: CD 36 02    call switch_context_0236
-0135: FD 7E 03    ld   a,(iy+$03)
-0138: B9          cp   c
+0135: FD 7E 03    ld   a,(iy+$03)           ; A = ID to kill
+0138: B9          cp   c                    ; is it me ?
 0139: 20 0B       jr   nz,$0146
 013B: 3C          inc  a
-013C: CC 00 00    call z,$0000
+013C: CC 00 00    call z,reset_0000         ; ID $FF -> reset
 013F: FD 36 01 00 ld   (iy+$01),$00
-0143: C3 BE 02    jp   $02BE
+0143: C3 BE 02    jp   free_task_slot_02be  ; free my slot, RET = back to the scheduler
 0146: C5          push bc
 0147: FD E5       push iy
 0149: 4F          ld   c,a
-014A: CD 7E 02    call $027E
-014D: FD 7E 00    ld   a,(iy+$00)
+014A: CD 7E 02    call get_tcb_by_task_id_027e
+014D: FD 7E 00    ld   a,(iy+$00)           ; is the ID still mapped to a live TCB ?
 0150: B9          cp   c
 0151: 20 07       jr   nz,$015A
-0153: CD BE 02    call $02BE
+0153: CD BE 02    call free_task_slot_02be
 0156: FD 36 01 00 ld   (iy+$01),$00
 015A: FD E1       pop  iy
 015C: C1          pop  bc
 015D: 79          ld   a,c
 015E: 3C          inc  a
-015F: 28 C6       jr   z,$0127
+015F: 28 C6       jr   z,kernel_return_to_nontask_0127
 0161: D9          exx
 0162: CD 96 02    call task_resume_0296
 0165: D5          push de
 0166: D9          exx
 0167: C9          ret
+
+;----------------------------------------------------------------------------
+; RST 18 : KILL ALL OTHER TASKS (keeps only the caller). From the non-task
+; context: kills every task.
+;----------------------------------------------------------------------------
+rst18_kill_other_tasks_0168:
 0168: CD 36 02    call switch_context_0236
 016B: 79          ld   a,c
 016C: 3C          inc  a
 016D: 28 17       jr   z,$0186
-016F: CD B4 02    call $02B4
-0172: ED 5B 02 81 ld   de,($8102)
+016F: CD B4 02    call slot_to_bitmask_02b4 ; keep only my slot
+0172: ED 5B 02 81 ld   de,(task_slot_mask_8102)
 0176: 7D          ld   a,l
 0177: A3          and  e
 0178: 6F          ld   l,a
 0179: 7C          ld   a,h
 017A: A2          and  d
 017B: 67          ld   h,a
-017C: 22 02 81    ld   ($8102),hl
+017C: 22 02 81    ld   (task_slot_mask_8102),hl
 017F: D9          exx
 0180: CD 96 02    call task_resume_0296
 0183: D5          push de
 0184: D9          exx
 0185: C9          ret
-0186: 21 00 00    ld   hl,$0000
-0189: 22 02 81    ld   ($8102),hl
-018C: 18 99       jr   $0127
+0186: 21 00 00    ld   hl,$0000             ; non-task caller: kill everything
+0189: 22 02 81    ld   (task_slot_mask_8102),hl
+018C: 18 99       jr   kernel_return_to_nontask_0127
+
+;----------------------------------------------------------------------------
+; RST 28 : SIGNAL EVENT.  in: A = event number.
+; Every task waiting (RST 20) for the same event number is resumed
+; IMMEDIATELY (synchronously, one after the other) until it yields.
+; out: the caller's A = $FF if at least one task was woken, else $00.
+; Event numbers used: $00 (stage finished -> task 2), $07 (graphics
+; loaded -> task 2 / ending), $69 (ending sync with task 2).
+;----------------------------------------------------------------------------
+rst28_signal_event_018e:
 018E: CD 36 02    call switch_context_0236
 0191: C5          push bc
 0192: FD E5       push iy
-0194: FD 5E 03    ld   e,(iy+$03)
+0194: FD 5E 03    ld   e,(iy+$03)           ; E = event number (caller A)
 0197: 16 00       ld   d,$00
 0199: AF          xor  a
-019A: 2A 02 81    ld   hl,($8102)
+019A: 2A 02 81    ld   hl,(task_slot_mask_8102)
 019D: CB 45       bit  0,l
 019F: 20 28       jr   nz,$01C9
 01A1: 3C          inc  a
@@ -378,11 +673,11 @@ stack_save_8104 = $8104
 01AA: 18 F1       jr   $019D
 01AC: FD E1       pop  iy
 01AE: C1          pop  bc
-01AF: FD 72 03    ld   (iy+$03),d
+01AF: FD 72 03    ld   (iy+$03),d           ; caller A := 0 or $FF (someone woke up)
 01B2: 79          ld   a,c
 01B3: 3C          inc  a
-01B4: CA 27 01    jp   z,$0127
-01B7: 2A 02 81    ld   hl,($8102)
+01B4: CA 27 01    jp   z,kernel_return_to_nontask_0127
+01B7: 2A 02 81    ld   hl,(task_slot_mask_8102)
 01BA: 04          inc  b
 01BB: CB 1C       rr   h
 01BD: CB 1D       rr   l
@@ -396,45 +691,67 @@ stack_save_8104 = $8104
 01C9: F5          push af
 01CA: E5          push hl
 01CB: 6F          ld   l,a
-01CC: CD 86 02    call $0286
-01CF: FD CB 01 6E bit  5,(iy+$01)
+01CC: CD 86 02    call get_tcb_by_slot_l_0286
+01CF: FD CB 01 6E bit  5,(iy+$01)           ; waiting for an event ?
 01D3: 28 06       jr   z,$01DB
 01D5: 7B          ld   a,e
-01D6: FD BE 03    cp   (iy+$03)
+01D6: FD BE 03    cp   (iy+$03)             ; same event number ?
 01D9: 28 04       jr   z,$01DF
 01DB: E1          pop  hl
 01DC: F1          pop  af
 01DD: 18 C2       jr   $01A1
 01DF: D5          push de
-01E0: 21 EE 01    ld   hl,$01EE
+01E0: 21 EE 01    ld   hl,signal_waiter_yielded_01ee
 01E3: E5          push hl
 01E4: FD 4E 00    ld   c,(iy+$00)
 01E7: D9          exx
-01E8: CD 96 02    call task_resume_0296
+01E8: CD 96 02    call task_resume_0296     ; run the waiting task now
 01EB: D5          push de
 01EC: D9          exx
 01ED: C9          ret
+
+signal_waiter_yielded_01ee:
 01EE: D1          pop  de
-01EF: 16 FF       ld   d,$FF
+01EF: 16 FF       ld   d,$FF                ; D = $FF : someone was woken
 01F1: E1          pop  hl
 01F2: F1          pop  af
 01F3: 18 AC       jr   $01A1
+
+;----------------------------------------------------------------------------
+; RST 20 : WAIT FOR EVENT.  in: A = event number. Status := $20, yields.
+; The task will only run again when someone signals this event (RST 28).
+; Called from the non-task context -> reset.
+;----------------------------------------------------------------------------
+rst20_wait_event_01f5:
 01F5: CD 36 02    call switch_context_0236
 01F8: 79          ld   a,c
 01F9: 3C          inc  a
-01FA: CA 00 00    jp   z,$0000
-01FD: FD 36 01 20 ld   (iy+$01),$20
-0201: C9          ret
+01FA: CA 00 00    jp   z,reset_0000         ; not allowed from the non-task context
+01FD: FD 36 01 20 ld   (iy+$01),$20         ; status = waiting for event
+0201: C9          ret                       ; yield (to the scheduler)
+
+;----------------------------------------------------------------------------
+; RST 30 : SLEEP.  in: A = number of frames (0 = 256 frames). Status := $40,
+; yields to the scheduler. This is THE normal "end of frame" for a task.
+; Called from the non-task context -> reset.
+;----------------------------------------------------------------------------
+rst30_task_sleep_0202:
 0202: CD 36 02    call switch_context_0236
 0205: 79          ld   a,c
 0206: 3C          inc  a
-0207: CC 00 00    call z,$0000
-020A: FD 36 01 40 ld   (iy+$01),$40
-020E: C9          ret
+0207: CC 00 00    call z,reset_0000         ; not allowed from the non-task context
+020A: FD 36 01 40 ld   (iy+$01),$40         ; status = sleeping, counter = A
+020E: C9          ret                       ; yield (to the scheduler)
+
+;----------------------------------------------------------------------------
+; Find the first free bit in the slot bitmap $8102, set it.
+; out: B = slot number. No free slot -> jp $0000 (reset).
+;----------------------------------------------------------------------------
+alloc_task_slot_020f:
 020F: 0E 10       ld   c,$10
 0211: 06 00       ld   b,$00
 0213: 11 01 00    ld   de,$0001
-0216: 2A 02 81    ld   hl,($8102)
+0216: 2A 02 81    ld   hl,(task_slot_mask_8102)
 0219: 7B          ld   a,e
 021A: B5          or   l
 021B: BD          cp   l
@@ -448,35 +765,46 @@ stack_save_8104 = $8104
 0227: 04          inc  b
 0228: 0D          dec  c
 0229: 20 EE       jr   nz,$0219
-022B: C3 00 00    jp   $0000
+022B: C3 00 00    jp   reset_0000           ; no free slot -> reset
 022E: 67          ld   h,a
 022F: 18 01       jr   $0232
 0231: 6F          ld   l,a
-0232: 22 02 81    ld   ($8102),hl
+0232: 22 02 81    ld   (task_slot_mask_8102),hl
 0235: C9          ret
 
+;----------------------------------------------------------------------------
+; Kernel entry used by every RST handler.
+; If C' = $FF (caller is not a task) -> save_registers_and_jump_026c.
+; Otherwise the caller task context is saved in its TCB:
+;   TCB+2 AF, +4 BC, +6 DE, +8 HL, +A IX, +C IY, +E return PC (after the RST)
+; and the handler continues with: IY = caller TCB, C = caller ID,
+; B = caller slot, A = caller A (primary set), caller BC/DE/HL in the
+; alternate set. The handler finally RETs to the scheduler or resumes a task.
+; NOTE: only the return PC is saved, NOT the stack: a task must yield with
+; nothing of its own on the stack (see print_string_slow_040e trick).
+;----------------------------------------------------------------------------
 switch_context_0236:
 0236: 08          ex   af,af'
 0237: D9          exx
-0238: E1          pop  hl		; hl contains return value
+0238: E1          pop  hl                   ; hl contains return value
 0239: 79          ld   a,c
 023A: 3C          inc  a
-023B: 28 2F       jr   z,save_registers_and_jump_026c		; if c == $ff jump
-023D: E3          ex   (sp),hl		; put return value in current stack
-023E: EB          ex   de,hl		; and contents of current stack in de
+023B: 28 2F       jr   z,save_registers_and_jump_026c  ; if c == $ff jump
+023D: E3          ex   (sp),hl              ; put return value in current stack
+023E: EB          ex   de,hl                ; and contents of current stack in de
 023F: 21 00 00    ld   hl,$0000
-0242: 39          add  hl,sp		; save stack value
+0242: 39          add  hl,sp                ; save stack value
 0243: 22 04 81    ld   (stack_save_8104),hl
-0246: FD E5       push iy
-0248: CD 7E 02    call $027E
+0246: FD E5       push iy                   ; caller task IY
+0248: CD 7E 02    call get_tcb_by_task_id_027e  ; IY = TCB of the calling task (C = its ID)
 024B: EB          ex   de,hl
 024C: 11 10 00    ld   de,$0010
 024F: FD 19       add  iy,de
 0251: D1          pop  de
 0252: F3          di
-0253: FD F9       ld   sp,iy
-0255: E5          push hl
-0256: D5          push de
+0253: FD F9       ld   sp,iy                ; SP = end of the TCB: registers are pushed into it
+0255: E5          push hl                   ; TCB+E = resume PC
+0256: D5          push de                   ; TCB+C = IY
 0257: 08          ex   af,af'
 0258: D9          exx
 0259: DD E5       push ix
@@ -484,14 +812,19 @@ switch_context_0236:
 025C: D5          push de
 025D: C5          push bc
 025E: F5          push af
-025F: FD 21 FE FF ld   iy,$FFFE
+025F: FD 21 FE FF ld   iy,$FFFE             ; IY = TCB base
 0263: FD 39       add  iy,sp
 0265: 2A 04 81    ld   hl,(stack_save_8104)
-0268: F9          ld   sp,hl
+0268: F9          ld   sp,hl                ; back to the kernel stack
 0269: D9          exx
 026A: FB          ei
 026B: C9          ret
 
+;----------------------------------------------------------------------------
+; Kernel entry from the NON-TASK context (C'=$FF, e.g. main_start_0cfa):
+; pushes all registers on the current stack, IY points to this pseudo TCB
+; (IY+3 = A) and jumps to the handler (HL).
+;----------------------------------------------------------------------------
 save_registers_and_jump_026c:
 026C: 08          ex   af,af'
 026D: D9          exx
@@ -503,35 +836,50 @@ save_registers_and_jump_026c:
 0275: F5          push af
 0276: D9          exx
 0277: FD 21 FE FF ld   iy,$FFFE
-027B: FD 39       add  iy,sp		; iy = sp-2
-027D: E9          jp   (hl)			; jump to hl
+027B: FD 39       add  iy,sp                ; iy = sp-2
+027D: E9          jp   (hl)                 ; jump to hl
 
+;----------------------------------------------------------------------------
+; in: C = task ID.  out: B = slot ($8106[ID]), IY = TCB address.
+; 0285: in B = slot.  0286: in L = slot.   TCB = $8000 + 16*slot.
+;----------------------------------------------------------------------------
+get_tcb_by_task_id_027e:
 027E: 06 00       ld   b,$00
-0280: 21 06 81    ld   hl,$8106
+0280: 21 06 81    ld   hl,task_id_to_slot_8106
 0283: 09          add  hl,bc
 0284: 46          ld   b,(hl)
+
+get_tcb_by_slot_b_0285:
 0285: 68          ld   l,b
+
+get_tcb_by_slot_l_0286:
 0286: 26 00       ld   h,$00
 0288: 29          add  hl,hl
 0289: 29          add  hl,hl
 028A: 29          add  hl,hl
 028B: 29          add  hl,hl
 028C: C5          push bc
-028D: 01 00 80    ld   bc,$8000
+028D: 01 00 80    ld   bc,tcb_table_8000
 0290: 09          add  hl,bc
 0291: E5          push hl
 0292: FD E1       pop  iy
 0294: C1          pop  bc
 0295: C9          ret
 
+;----------------------------------------------------------------------------
+; Resume the task whose TCB is IY: pops AF,BC,DE,HL,IX,IY from the TCB,
+; EXX, DE = saved PC. The caller then does "push de / exx / ret" to jump
+; into the task with its registers restored (C' = task ID stays in the
+; alternate set).
+;----------------------------------------------------------------------------
 task_resume_0296:
 0296: 21 00 00    ld   hl,$0000
-0299: 39          add  hl,sp		; copy sp value in hl
-029A: 22 04 81    ld   (stack_save_8104),hl	; store sp value in memory
+0299: 39          add  hl,sp                ; copy sp value in hl
+029A: 22 04 81    ld   (stack_save_8104),hl ; store sp value in memory
 029D: FD 23       inc  iy
 029F: FD 23       inc  iy
 02A1: F3          di
-02A2: FD F9       ld   sp,iy
+02A2: FD F9       ld   sp,iy                ; SP = TCB+2: pop the saved registers
 02A4: F1          pop  af
 02A5: C1          pop  bc
 02A6: D1          pop  de
@@ -539,12 +887,16 @@ task_resume_0296:
 02A8: DD E1       pop  ix
 02AA: FD E1       pop  iy
 02AC: D9          exx
-02AD: D1          pop  de
+02AD: D1          pop  de                   ; DE = resume PC
 02AE: 2A 04 81    ld   hl,(stack_save_8104)
 02B1: F9          ld   sp,hl
 02B2: FB          ei
 02B3: C9          ret
 
+;----------------------------------------------------------------------------
+; in: B = slot.  out: HL = 1 << B
+;----------------------------------------------------------------------------
+slot_to_bitmask_02b4:
 02B4: 21 01 00    ld   hl,$0001
 02B7: 04          inc  b
 02B8: 05          dec  b
@@ -553,8 +905,12 @@ task_resume_0296:
 02BB: 10 FD       djnz $02BA
 02BD: C9          ret
 
-02BE: CD B4 02    call $02B4
-02C1: ED 5B 02 81 ld   de,($8102)
+;----------------------------------------------------------------------------
+; Free slot B in the allocation bitmap $8102.
+;----------------------------------------------------------------------------
+free_task_slot_02be:
+02BE: CD B4 02    call slot_to_bitmask_02b4
+02C1: ED 5B 02 81 ld   de,(task_slot_mask_8102)
 02C5: 7D          ld   a,l
 02C6: 2F          cpl
 02C7: A3          and  e
@@ -563,63 +919,119 @@ task_resume_0296:
 02CA: 2F          cpl
 02CB: A2          and  d
 02CC: 67          ld   h,a
-02CD: 22 02 81    ld   ($8102),hl
+02CD: 22 02 81    ld   (task_slot_mask_8102),hl
 02D0: C9          ret
 02D1: 00          nop
 02D2: 00          nop
 02D3: 00          nop
 02D4: 00          nop
-02D5: C3 0E 04    jp   $040E
-02D8: C3 67 08    jp   $0867
-02DB: C3 4A 13    jp   $134A
-02DE: C3 5C 11    jp   $115C
-02E1: C3 8C 0B    jp   $0B8C
-02E4: C3 F5 03    jp   $03F5
-02E7: C3 9F 12    jp   $129F
-02EA: C3 A9 0C    jp   $0CA9
-02ED: C3 B0 0C    jp   $0CB0
-02F0: C3 19 0D    jp   $0D19
-02F3: C3 F1 0D    jp   $0DF1
-02F6: C3 51 0E    jp   $0E51
-02F9: C3 5C 10    jp   $105C
-02FC: C3 7C 11    jp   $117C
-02FF: C3 E2 13    jp   $13E2
-0302: C3 8D 10    jp   $108D
-0305: C3 C0 10    jp   $10C0
 
+;----------------------------------------------------------------------------
+; JUMP TABLE (fixed entry points, also referenced by the task address table).
+; 02D5 print_string_slow   02D8 set_video_enable   02DB init_scrolling_map
+; 02DE scroll_speed_lookup 02E1 load_palette       02E4 draw_tile_block
+; 02E7 compute_scroll_regs 02EA select_rom_bank0   02ED select_rom_bank1
+; 02F0 task 00  02F3 task 01  02F6 task 02  02F9 task 03
+; 02FC task 04  02FF task 05  0302 task 06  0305 task 07
+;----------------------------------------------------------------------------
+vec_print_string_slow_02d5:
+02D5: C3 0E 04    jp   print_string_slow_040e
+
+vec_set_video_enable_02d8:
+02D8: C3 67 08    jp   set_video_enable_0867
+
+vec_init_scrolling_map_02db:
+02DB: C3 4A 13    jp   init_scrolling_map_134a
+
+vec_scroll_speed_lookup_02de:
+02DE: C3 5C 11    jp   scroll_speed_lookup_115c
+
+vec_load_palette_02e1:
+02E1: C3 8C 0B    jp   load_palette_default_0b8c
+
+vec_draw_tile_block_02e4:
+02E4: C3 F5 03    jp   draw_tile_block_03f5
+
+vec_compute_scroll_regs_02e7:
+02E7: C3 9F 12    jp   compute_scroll_regs_129f
+
+vec_select_rom_bank0_02ea:
+02EA: C3 A9 0C    jp   select_rom_bank0_0ca9
+
+vec_select_rom_bank1_02ed:
+02ED: C3 B0 0C    jp   select_rom_bank1_0cb0
+
+vec_task00_02f0:
+02F0: C3 19 0D    jp   task00_attract_0d19
+
+vec_task01_02f3:
+02F3: C3 F1 0D    jp   task01_wait_start_0df1
+
+vec_task02_02f6:
+02F6: C3 51 0E    jp   task02_game_flow_0e51
+
+vec_task03_02f9:
+02F9: C3 5C 10    jp   task03_bonus_timer_105c
+
+vec_task04_02fc:
+02FC: C3 7C 11    jp   task04_scroll_117c
+
+vec_task05_02ff:
+02FF: C3 E2 13    jp   task05_sprite_positions_13e2
+
+vec_task06_0302:
+0302: C3 8D 10    jp   task06_award_pending_score_108d
+
+vec_task07_0305:
+0305: C3 C0 10    jp   task07_load_stage_gfx_10c0
+
+;----------------------------------------------------------------------------
+; COLD BOOT (DI). Clears work RAM, SP=$87FE, video off, copies the sprite
+; graphics from the graphics ROMs to char RAM, system init (dips, coins,
+; sound, palette, screen), then:
+;   DSW1 bit 5 (service switch, active low) OFF -> main_start_0cfa (game)
+;                                           ON  -> RAM test screen
+;----------------------------------------------------------------------------
 boot_0308:
-0308: ED 56       im   1            ; interrupt mode 1 (RST 38h on /INT)
-030A: 21 00 80    ld   hl,$8000     ; zero-fill all Work RAM ($8000–$87FF)
+0308: ED 56       im   1                    ; interrupt mode 1 (RST 38h on /INT)
+030A: 21 00 80    ld   hl,$8000             ; zero-fill all work RAM ($8000-$87FF)
 030D: 36 00       ld   (hl),$00
 030F: 11 01 80    ld   de,$8001
 0312: 01 FF 07    ld   bc,$07FF
 0315: ED B0       ldir
-0317: 31 FE 87    ld   sp,$87FE     ; stack at top of Work RAM
-031A: 06 00       ld   b,$00        ; call game_state_init_table (jp vector #0)
-031C: CD D8 02    call $02D8        ; decompress / upload GFX tile data to char RAM
-031F: CD B8 07    call $07B8        ; hardware init: AY sound, scroll regs, palette
-0322: CD CE 09    call $09CE        ; read DSW1
-0325: 3A 0A D4    ld   a,($D40A)    
-0328: CB 6F       bit  5,a          ; test "Cabinet type" dip switch
-032A: C2 FA 0C    jp   nz,$0CFA     ; attract / demo mode if set
-032D: 3E 09       ld   a,$09        ; set color bank
-032F: 32 06 D5    ld   ($D506),a
-0332: CD 8D 04    call $048D
-0335: 21 00 D0    ld   hl,$D000
+0317: 31 FE 87    ld   sp,$87FE             ; stack at top of work RAM
+031A: 06 00       ld   b,$00                ; B=0: all layers and sprites off
+031C: CD D8 02    call vec_set_video_enable_02d8  ; set_video_enable
+031F: CD B8 07    call load_sprite_charset_07b8  ; copy sprite graphics gfx ROM -> char RAM
+0322: CD CE 09    call system_init_09ce     ; system init (dips, coins, sound, palette, screen)
+0325: 3A 0A D4    ld   a,(dsw1_d40a)        ; DSW1
+0328: CB 6F       bit  5,a                  ; bit 5 = service switch (active low)
+032A: C2 FA 0C    jp   nz,main_start_0cfa   ; not in service mode -> start the game
+032D: 3E 09       ld   a,$09                ; service mode: RAM test screen
+032F: 32 06 D5    ld   (colorbank_d506),a
+0332: CD 8D 04    call clear_layer1_048d
+0335: 21 00 D0    ld   hl,colscroll_d000
 0338: 01 60 00    ld   bc,$0060
-033B: CD EA 03    call $03EA
-033E: 21 C4 03    ld   hl,$03C4
+033B: CD EA 03    call clear_mem_double_03ea
+033E: 21 C4 03    ld   hl,$03C4             ; 'RAM CHECK MODE'
 0341: 11 06 C5    ld   de,$C506
 0344: 01 0E 00    ld   bc,$000E
 0347: ED B0       ldir
-0349: CD 5D 03    call $035D
-034C: DA BB 09    jp   c,$09BB
-034F: 21 DE 03    ld   hl,$03DE
+0349: CD 5D 03    call ram_test_035d        ; RAM test
+034C: DA BB 09    jp   c,delay_and_reset_09bb  ; error -> message stays, delay, reset
+034F: 21 DE 03    ld   hl,$03DE             ; 'NO RAM ERROR'
 0352: 11 47 C5    ld   de,$C547
 0355: 01 0C 00    ld   bc,$000C
 0358: ED B0       ldir
-035A: C3 BB 09    jp   $09BB
-035D: DD E1       pop  ix
+035A: C3 BB 09    jp   delay_and_reset_09bb
+
+;----------------------------------------------------------------------------
+; RAM test ($8000-$87FF, patterns $AA/$55). Pops its return address into IX
+; because the RAM (and the stack) is destroyed by the test.
+; out: CF=0 OK / CF=1 error (screen shows BAD RAM ADDR xxxx BIT xx).
+;----------------------------------------------------------------------------
+ram_test_035d:
+035D: DD E1       pop  ix                   ; save return address (RAM will be overwritten)
 035F: 0E 02       ld   c,$02
 0361: 06 55       ld   b,$55
 0363: 78          ld   a,b
@@ -644,7 +1056,7 @@ boot_0308:
 0384: A7          and  a
 0385: DD E5       push ix
 0387: C9          ret
-0388: E5          push hl
+0388: E5          push hl                   ; error: print BIT / address
 0389: AE          xor  (hl)
 038A: 47          ld   b,a
 038B: 21 8F C5    ld   hl,$C58F
@@ -656,7 +1068,7 @@ boot_0308:
 0396: 23          inc  hl
 0397: 23          inc  hl
 0398: 23          inc  hl
-0399: CD B6 03    call $03B6
+0399: CD B6 03    call print_hex_byte_03b6
 039C: 21 D2 03    ld   hl,$03D2
 039F: 11 47 C5    ld   de,$C547
 03A2: 01 0C 00    ld   bc,$000C
@@ -665,12 +1077,17 @@ boot_0308:
 03A8: 23          inc  hl
 03A9: D1          pop  de
 03AA: 42          ld   b,d
-03AB: CD B6 03    call $03B6
+03AB: CD B6 03    call print_hex_byte_03b6
 03AE: 23          inc  hl
 03AF: 43          ld   b,e
-03B0: CD B6 03    call $03B6
+03B0: CD B6 03    call print_hex_byte_03b6
 03B3: 37          scf
 03B4: 18 CF       jr   $0385
+
+;----------------------------------------------------------------------------
+; Print B as 2 hex digits at HL (2 tiles).
+;----------------------------------------------------------------------------
+print_hex_byte_03b6:
 03B6: 78          ld   a,b
 03B7: 0F          rrca
 03B8: 0F          rrca
@@ -683,35 +1100,19 @@ boot_0308:
 03C0: E6 0F       and  $0F
 03C2: 77          ld   (hl),a
 03C3: C9          ret
-03C4: 1B          dec  de
-03C5: 0A          ld   a,(bc)
-03C6: 16 FF       ld   d,$FF
-03C8: 0C          inc  c
-03C9: 11 0E 0C    ld   de,$0C0E
-03CC: 14          inc  d
-03CD: FF          rst  $38
-03CE: 16 18       ld   d,$18
-03D0: 0D          dec  c
-03D1: 0E 0B       ld   c,$0B
-03D3: 0A          ld   a,(bc)
-03D4: 0D          dec  c
-03D5: FF          rst  $38
-03D6: 1B          dec  de
-03D7: 0A          ld   a,(bc)
-03D8: 16 FF       ld   d,$FF
-03DA: 0A          ld   a,(bc)
-03DB: 0D          dec  c
-03DC: 0D          dec  c
-03DD: 1B          dec  de
-03DE: 17          rla
-03DF: 18 FF       jr   $03E0
-03E1: 1B          dec  de
-03E2: 0A          ld   a,(bc)
-03E3: 16 FF       ld   d,$FF
-03E5: 0E 1B       ld   c,$1B
-03E7: 1B          dec  de
-03E8: 18 1B       jr   $0405
+
+;----------------------------------------------------------------------------
+; DATA: texts for the RAM test (tile codes, see character set in file header)
+;----------------------------------------------------------------------------
+text_ram_check_mode_03c4:
+
+;----------------------------------------------------------------------------
+; Fill BC bytes at HL with 0. 03EB: fill with A. Every byte is written TWICE (see hardware notes).
+;----------------------------------------------------------------------------
+clear_mem_double_03ea:
 03EA: AF          xor  a
+
+fill_mem_double_03eb:
 03EB: 57          ld   d,a
 03EC: 72          ld   (hl),d
 03ED: 72          ld   (hl),d
@@ -721,6 +1122,12 @@ boot_0308:
 03F1: B1          or   c
 03F2: 20 F8       jr   nz,$03EC
 03F4: C9          ret
+
+;----------------------------------------------------------------------------
+; Draw a rectangular block of tiles. in: HL = screen address, DE -> [w, h,
+; w*h tile codes]. Rows are 32 bytes apart.
+;----------------------------------------------------------------------------
+draw_tile_block_03f5:
 03F5: 1A          ld   a,(de)
 03F6: 4F          ld   c,a
 03F7: 13          inc  de
@@ -742,38 +1149,70 @@ boot_0308:
 040A: C1          pop  bc
 040B: 10 EE       djnz $03FB
 040D: C9          ret
+
+;----------------------------------------------------------------------------
+; Print a string with a delay between characters ("typewriter").
+; in: HL = screen address, DE -> [length, codes...], C = frames per char.
+; !! YIELDS (RST 30) INSIDE A SUBROUTINE: since the kernel does not save the
+; stack, the routine first POPs its return address (IX) and the scheduler
+; return address below it (IY): IX/IY are saved in the TCB, and pushed back
+; before the final RET. Any port must keep this working (or give every task
+; its own stack).
+;----------------------------------------------------------------------------
+print_string_slow_040e:
 040E: 1A          ld   a,(de)
 040F: A7          and  a
 0410: C8          ret  z
-0411: DD E1       pop  ix
-0413: FD E1       pop  iy
+0411: DD E1       pop  ix                   ; pop return address (caller)
+0413: FD E1       pop  iy                   ; pop the scheduler return address below it
 0415: 47          ld   b,a
 0416: 13          inc  de
 0417: 1A          ld   a,(de)
-0418: 77          ld   (hl),a
+0418: 77          ld   (hl),a               ; written twice (hardware)
 0419: 77          ld   (hl),a
 041A: 13          inc  de
 041B: 23          inc  hl
 041C: 79          ld   a,c
-041D: F7          rst  $30
+041D: F7          rst  $30                  ; SLEEP A frames (yield) - SLEEP C frames between chars (yield!)
 041E: 10 F7       djnz $0417
-0420: FD E5       push iy
+0420: FD E5       push iy                   ; push back the 2 return addresses
 0422: DD E5       push ix
 0424: C9          ret
+
+;----------------------------------------------------------------------------
+; Score / timer display. 0425: high score. 042D: current player's score.
+; 0433: P1 score (or current). 043B: P2 score. 0445: current bonus timer
+; (C=$80: bit 7 set on digits = other colour). 0458: print 6 BCD digits
+; from DE (MSB first, DE decrementing) with leading-zero suppression.
+;----------------------------------------------------------------------------
+draw_hiscore_0425:
 0425: 21 6D C4    ld   hl,$C46D
 0428: 11 6D 81    ld   de,$816D
-042B: 18 14       jr   $0441
-042D: 3A 56 81    ld   a,($8156)
+042B: 18 14       jr   draw_score_common_0441
+
+draw_current_score_042d:
+042D: 3A 56 81    ld   a,(cur_player_8156)
 0430: A7          and  a
-0431: 28 08       jr   z,$043B
+0431: 28 08       jr   z,draw_p2_score_043b
+
+draw_p1_score_0433:
 0433: 21 63 C4    ld   hl,$C463
 0436: 11 70 81    ld   de,$8170
-0439: 18 06       jr   $0441
+0439: 18 06       jr   draw_score_common_0441
+
+draw_p2_score_043b:
 043B: 21 77 C4    ld   hl,$C477
 043E: 11 73 81    ld   de,$8173
+
+draw_score_common_0441:
 0441: 0E 00       ld   c,$00
-0443: 18 13       jr   $0458
-0445: 3A 56 81    ld   a,($8156)
+0443: 18 13       jr   print_bcd6_0458
+
+;----------------------------------------------------------------------------
+; Draw the current player's bonus timer at $C46D (called every frame by the IRQ).
+;----------------------------------------------------------------------------
+draw_bonus_timer_0445:
+0445: 3A 56 81    ld   a,(cur_player_8156)
 0448: A7          and  a
 0449: 28 05       jr   z,$0450
 044B: 11 30 84    ld   de,$8430
@@ -781,6 +1220,8 @@ boot_0308:
 0450: 11 33 84    ld   de,$8433
 0453: 21 6D C4    ld   hl,$C46D
 0456: 0E 80       ld   c,$80
+
+print_bcd6_0458:
 0458: 06 06       ld   b,$06
 045A: CB 40       bit  0,b
 045C: 20 09       jr   nz,$0467
@@ -789,17 +1230,22 @@ boot_0308:
 0460: 0F          rrca
 0461: 0F          rrca
 0462: 0F          rrca
-0463: CD 75 04    call $0475
+0463: CD 75 04    call print_bcd_digit_0475
 0466: 05          dec  b
 0467: 05          dec  b
 0468: 20 02       jr   nz,$046C
 046A: CB C1       set  0,c
 046C: 04          inc  b
 046D: 1A          ld   a,(de)
-046E: CD 75 04    call $0475
+046E: CD 75 04    call print_bcd_digit_0475
 0471: 1B          dec  de
 0472: 10 EA       djnz $045E
 0474: C9          ret
+
+;----------------------------------------------------------------------------
+; Print low nibble of A as one digit (blank if leading zero). Writes twice.
+;----------------------------------------------------------------------------
+print_bcd_digit_0475:
 0475: E6 0F       and  $0F
 0477: 28 0C       jr   z,$0485
 0479: CB C1       set  0,c
@@ -814,107 +1260,108 @@ boot_0308:
 0487: 20 F2       jr   nz,$047B
 0489: 3E FF       ld   a,$FF
 048B: 18 EE       jr   $047B
+
+;----------------------------------------------------------------------------
+; Clear layer 1 video RAM ($C400-$C7FF) with blank tile $FF, then layer-1-only video mode.
+;----------------------------------------------------------------------------
+clear_layer1_048d:
 048D: 21 00 C4    ld   hl,$C400
 0490: 36 FF       ld   (hl),$FF
 0492: 11 01 C4    ld   de,$C401
 0495: 01 FF 03    ld   bc,$03FF
 0498: ED B0       ldir
-049A: 18 12       jr   $04AE
+049A: 18 12       jr   video_layer1_only_04ae
 
-update_scrolling_049c:
+;----------------------------------------------------------------------------
+; (was 'update_scrolling_049c') Clear the playfield part of layer 1 ($C480-
+; $C77F, keeps the top 4 header rows), blank the left/right border columns,
+; then video mode = layer 1 only (b=$10).
+;----------------------------------------------------------------------------
+clear_playfield_049c:
 049C: 21 80 C4    ld   hl,$C480
 049F: 36 FF       ld   (hl),$FF
 04A1: 11 81 C4    ld   de,$C481
 04A4: 01 FF 02    ld   bc,$02FF
 04A7: ED B0       ldir
 04A9: 06 FF       ld   b,$FF
-04AB: CD D0 13    call $13D0
+04AB: CD D0 13    call draw_border_columns_13d0
+
+video_layer1_only_04ae:
 04AE: 06 10       ld   b,$10
-04B0: CD D8 02    call $02D8
+04B0: CD D8 02    call vec_set_video_enable_02d8
 04B3: C9          ret
 
-04B4: CD 8D 04    call $048D
-04B7: CD F1 04    call $04F1
-04BA: 3A 6A 81    ld   a,($816A)
+;----------------------------------------------------------------------------
+; Draw the title / attract header: scores header, 2UP header if 2 players, CREDIT, (c)TAITO CORPORATION, year.
+;----------------------------------------------------------------------------
+draw_title_header_04b4:
+04B4: CD 8D 04    call clear_layer1_048d
+04B7: CD F1 04    call draw_score_header_04f1
+04BA: 3A 6A 81    ld   a,(two_player_game_816a)
 04BD: A7          and  a
-04BE: C4 03 05    call nz,$0503
-04C1: CD E0 04    call $04E0
+04BE: C4 03 05    call nz,draw_p2_header_0503
+04C1: CD E0 04    call draw_credit_label_04e0
 04C4: 21 05 C7    ld   hl,$C705
 04C7: 11 29 05    ld   de,$0529
 04CA: 0E 01       ld   c,$01
-04CC: CD D5 02    call $02D5
-04CF: 3A 5D 81    ld   a,($815D)
+04CC: CD D5 02    call vec_print_string_slow_02d5
+04CF: 3A 5D 81    ld   a,(dsw_year_display_815d)
 04D2: A7          and  a
 04D3: C8          ret  z
 04D4: 21 17 C7    ld   hl,$C717
 04D7: 11 3C 05    ld   de,$053C
 04DA: 0E 01       ld   c,$01
-04DC: CD D5 02    call $02D5
+04DC: CD D5 02    call vec_print_string_slow_02d5
 04DF: C9          ret
+
+draw_credit_label_04e0:
 04E0: 21 42 05    ld   hl,$0542
 04E3: 11 B6 C7    ld   de,$C7B6
 04E6: 01 07 00    ld   bc,$0007
 04E9: ED B0       ldir
-04EB: 21 69 81    ld   hl,$8169
+04EB: 21 69 81    ld   hl,credits_8169
 04EE: C3 9C 09    jp   $099C
+
+draw_score_header_04f1:
 04F1: 21 15 05    ld   hl,$0515
 04F4: 11 41 C4    ld   de,$C441
 04F7: 01 14 00    ld   bc,$0014
 04FA: ED B0       ldir
-04FC: CD 33 04    call $0433
-04FF: CD 25 04    call $0425
+04FC: CD 33 04    call draw_p1_score_0433
+04FF: CD 25 04    call draw_hiscore_0425
 0502: C9          ret
+
+draw_p2_header_0503:
 0503: 21 15 05    ld   hl,$0515
 0506: 11 55 C4    ld   de,$C455
 0509: 01 08 00    ld   bc,$0008
 050C: ED B0       ldir
 050E: EB          ex   de,hl
 050F: 36 02       ld   (hl),$02
-0511: CD 3B 04    call $043B
+0511: CD 3B 04    call draw_p2_score_043b
 0514: C9          ret
-0515: FF          rst  $38
-0516: 19          add  hl,de
-0517: 15          dec  d
-0518: 0A          ld   a,(bc)
-0519: 22 0E 1B    ld   ($1B0E),hl
-051C: 27          daa
-051D: 01 FF FF    ld   bc,$FFFF
-0520: 11 12 27    ld   de,$2712
-0523: 1C          inc  e
-0524: 0C          inc  c
-0525: 18 1B       jr   $0542
-0527: 0E FF       ld   c,$FF
-0529: 12          ld   (de),a
-052A: 2B          dec  hl
-052B: 1D          dec  e
-052C: 0A          ld   a,(bc)
-052D: 12          ld   (de),a
-052E: 1D          dec  e
-052F: 18 FF       jr   $0530
-0531: 0C          inc  c
-0532: 18 1B       jr   $054F
-0534: 19          add  hl,de
-0535: 18 1B       jr   $0552
-0537: 0A          ld   a,(bc)
-0538: 1D          dec  e
-0539: 12          ld   (de),a
-053A: 18 17       jr   $0553
-053C: 05          dec  b
-053D: FF          rst  $38
-053E: 01 09 08    ld   bc,$0809
-0541: 02          ld   (bc),a
-0542: 0C          inc  c
-0543: 1B          dec  de
-0544: 0E 0D       ld   c,$0D
-0546: 12          ld   (de),a
-0547: 1D          dec  e
-0548: 27          daa
-0549: CD 9C 04    call update_scrolling_049c
+
+;----------------------------------------------------------------------------
+; DATA: ' PLAYER-1 ' ... ' HI-SCORE ' header texts
+;----------------------------------------------------------------------------
+text_player_hiscore_0515:
+
+; DATA: [len]'(c)TAITO CORPORATION'
+
+; DATA: [len]' 1982'
+
+; DATA: 'CREDIT-'
+
+;----------------------------------------------------------------------------
+; Attract 'INSERT COINS' page: prints the coinage settings of slot A (and B = LEFT/RIGHT ENTRY).
+;----------------------------------------------------------------------------
+draw_insert_coin_screen_0549:
+0549: CD 9C 04    call clear_playfield_049c
 054C: 21 68 C5    ld   hl,$C568
 054F: 11 BA 05    ld   de,$05BA
 0552: 0E 01       ld   c,$01
-0554: CD D5 02    call $02D5
-0557: 3A 67 81    ld   a,($8167)
+0554: CD D5 02    call vec_print_string_slow_02d5
+0557: 3A 67 81    ld   a,(dsw_coin_b_enabled_8167)
 055A: A7          and  a
 055B: 20 0B       jr   nz,$0568
 055D: 21 61 81    ld   hl,$8161
@@ -922,26 +1369,31 @@ update_scrolling_049c:
 0561: 23          inc  hl
 0562: 46          ld   b,(hl)
 0563: 11 48 C6    ld   de,$C648
-0566: 18 2B       jr   $0593
+0566: 18 2B       jr   print_coinage_line_0593
 0568: 21 EB C5    ld   hl,$C5EB
 056B: 11 CA 05    ld   de,$05CA
 056E: 0E 01       ld   c,$01
-0570: CD D5 02    call $02D5
+0570: CD D5 02    call vec_print_string_slow_02d5
 0573: 21 8A C6    ld   hl,$C68A
 0576: 11 D5 05    ld   de,$05D5
 0579: 0E 01       ld   c,$01
-057B: CD D5 02    call $02D5
+057B: CD D5 02    call vec_print_string_slow_02d5
 057E: 21 61 81    ld   hl,$8161
 0581: 7E          ld   a,(hl)
 0582: 23          inc  hl
 0583: 46          ld   b,(hl)
 0584: 11 29 C6    ld   de,$C629
-0587: CD 93 05    call $0593
+0587: CD 93 05    call print_coinage_line_0593
 058A: 21 65 81    ld   hl,$8165
 058D: 7E          ld   a,(hl)
 058E: 23          inc  hl
 058F: 46          ld   b,(hl)
 0590: 11 C9 C6    ld   de,$C6C9
+
+;----------------------------------------------------------------------------
+; Print '<n> COIN(S) <m> PLAYER(S)' line. A = coins, B = credits, DE = screen.
+;----------------------------------------------------------------------------
+print_coinage_line_0593:
 0593: 12          ld   (de),a
 0594: 13          inc  de
 0595: C5          push bc
@@ -966,38 +1418,15 @@ update_scrolling_049c:
 05B6: 3E 1C       ld   a,$1C
 05B8: 12          ld   (de),a
 05B9: C9          ret
-05BA: 0F          rrca
-05BB: 12          ld   (de),a
-05BC: 17          rla
-05BD: 1C          inc  e
-05BE: 0E 1B       ld   c,$1B
-05C0: 1D          dec  e
-05C1: FF          rst  $38
-05C2: FF          rst  $38
-05C3: FF          rst  $38
-05C4: FF          rst  $38
-05C5: 0C          inc  c
-05C6: 18 12       jr   $05DA
-05C8: 17          rla
-05C9: 1C          inc  e
-05CA: 0A          ld   a,(bc)
-05CB: 15          dec  d
-05CC: 0E 0F       ld   c,$0F
-05CE: 1D          dec  e
-05CF: FF          rst  $38
-05D0: 0E 17       ld   c,$17
-05D2: 1D          dec  e
-05D3: 1B          dec  de
-05D4: 22 0B 1B    ld   ($1B0B),hl
-05D7: 12          ld   (de),a
-05D8: 10 11       djnz $05EB
-05DA: 1D          dec  e
-05DB: FF          rst  $38
-05DC: 0E 17       ld   c,$17
-05DE: 1D          dec  e
-05DF: 1B          dec  de
-05E0: 22 CD 9C    ld   ($9CCD),hl
-05E3: 04          inc  b
+
+;----------------------------------------------------------------------------
+; DATA: [len]'INSERT    COINS', ' COIN', 'LEFT ENTRY', 'RIGHT ENTRY'
+;----------------------------------------------------------------------------
+text_insert_coins_05ba:
+
+; 'PUSH ONLY 1 PLAYER BUTTON' (1 credit).
+draw_push_1p_button_05e1:
+05E1: CD 9C 04    call clear_playfield_049c ; clear the playfield (was mis-disassembled as ld ($9CCD),hl / inc b)
 05E4: 21 0A 06    ld   hl,$060A
 05E7: 11 6E C5    ld   de,$C56E
 05EA: 01 04 00    ld   bc,$0004
@@ -1007,75 +1436,28 @@ update_scrolling_049c:
 05F5: 01 14 00    ld   bc,$0014
 05F8: ED B0       ldir
 05FA: C9          ret
-05FB: CD E1 05    call $05E1
+
+;----------------------------------------------------------------------------
+; 'PUSH 1 OR 2 PLAYERS BUTTON' (2+ credits).
+;----------------------------------------------------------------------------
+draw_push_1or2p_button_05fb:
+05FB: CD E1 05    call draw_push_1p_button_05e1
 05FE: 21 22 06    ld   hl,$0622
 0601: 11 E4 C5    ld   de,$C5E4
 0604: 01 0F 00    ld   bc,$000F
 0607: ED B0       ldir
 0609: C9          ret
-060A: 19          add  hl,de
-060B: 1E 1C       ld   e,$1C
-060D: 11 18 17    ld   de,$1718
-0610: 15          dec  d
-0611: 22 FF FF    ld   ($FFFF),hl
-0614: 01 19 15    ld   bc,$1519
-0617: 0A          ld   a,(bc)
-0618: 22 0E 1B    ld   ($1B0E),hl
-061B: FF          rst  $38
-061C: 0B          dec  bc
-061D: 1E 1D       ld   e,$1D
-061F: 1D          dec  e
-0620: 18 17       jr   $0639
-0622: 01 FF 18    ld   bc,$18FF
-0625: 1B          dec  de
-0626: FF          rst  $38
-0627: 02          ld   (bc),a
-0628: FF          rst  $38
-0629: FF          rst  $38
-062A: 19          add  hl,de
-062B: 15          dec  d
-062C: 0A          ld   a,(bc)
-062D: 22 0E 1B    ld   ($1B0E),hl
-0630: 1C          inc  e
-0631: 0F          rrca
-0632: 0C          inc  c
-0633: 18 17       jr   $064C
-0635: 10 1B       djnz $0652
-0637: 0A          ld   a,(bc)
-0638: 1D          dec  e
-0639: 1E 15       ld   e,$15
-063B: 0A          ld   a,(bc)
-063C: 1D          dec  e
-063D: 12          ld   (de),a
-063E: 18 17       jr   $0657
-0640: 1C          inc  e
-0641: 0A          ld   a,(bc)
-0642: 10 0A       djnz $064E
-0644: 16 0E       ld   d,$0E
-0646: FF          rst  $38
-0647: FF          rst  $38
-0648: 18 1F       jr   $0669
-064A: 0E 1B       ld   c,$1B
-064C: 14          inc  d
-064D: 19          add  hl,de
-064E: 15          dec  d
-064F: 0A          ld   a,(bc)
-0650: 22 0E 1B    ld   ($1B0E),hl
-0653: 29          add  hl,hl
-0654: 01 2A FF    ld   bc,$FF2A
-0657: FF          rst  $38
-0658: 10 0A       djnz $0664
-065A: 16 0E       ld   d,$0E
-065C: FF          rst  $38
-065D: 18 1F       jr   $067E
-065F: 0E 1B       ld   c,$1B
-0661: 0F          rrca
-0662: 1B          dec  de
-0663: 0E 0E       ld   c,$0E
-0665: FF          rst  $38
-0666: 10 0A       djnz $0672
-0668: 16 0E       ld   d,$0E
-066A: 3A 5C 81    ld   a,($815C)
+
+;----------------------------------------------------------------------------
+; DATA: 'PUSH', 'ONLY  1PLAYER BUTTON', '1 OR 2  PLAYERS', 'CONGRATULATIONS', 'GAME OVER', 'PLAYER<n> GAME OVER', 'FREE GAME'
+;----------------------------------------------------------------------------
+text_push_060a:
+
+;----------------------------------------------------------------------------
+; Draw remaining lives (man icons $2E) or 'FREE GAME' at $C7A2.
+;----------------------------------------------------------------------------
+draw_lives_066a:
+066A: 3A 5C 81    ld   a,(dsw_lives_limited_815c)
 066D: A7          and  a
 066E: 20 0C       jr   nz,$067C
 0670: 21 61 06    ld   hl,$0661
@@ -1083,22 +1465,29 @@ update_scrolling_049c:
 0676: 01 09 00    ld   bc,$0009
 0679: ED B0       ldir
 067B: C9          ret
-067C: CD 81 0B    call $0B81
+067C: CD 81 0B    call get_lives_ptr_0b81
 067F: 46          ld   b,(hl)
 0680: 21 A2 C7    ld   hl,$C7A2
 0683: 05          dec  b
 0684: 28 05       jr   z,$068B
 0686: 3E 2E       ld   a,$2E
-0688: CD 93 06    call $0693
+0688: CD 93 06    call fill_row_double_0693
 068B: 3E FF       ld   a,$FF
 068D: 06 08       ld   b,$08
-068F: CD 93 06    call $0693
+068F: CD 93 06    call fill_row_double_0693
 0692: C9          ret
+
+fill_row_double_0693:
 0693: 77          ld   (hl),a
 0694: 77          ld   (hl),a
 0695: 23          inc  hl
-0696: 10 FB       djnz $0693
+0696: 10 FB       djnz fill_row_double_0693
 0698: C9          ret
+
+;----------------------------------------------------------------------------
+; Clear the credit area and draw the 'BONUS' label tiles ($1085) at $C44C.
+;----------------------------------------------------------------------------
+draw_bonus_label_0699:
 0699: 21 B6 C7    ld   hl,$C7B6
 069C: 36 FF       ld   (hl),$FF
 069E: 11 B7 C7    ld   de,$C7B7
@@ -1109,9 +1498,14 @@ update_scrolling_049c:
 06AC: 01 08 00    ld   bc,$0008
 06AF: ED B0       ldir
 06B1: C9          ret
+
+;----------------------------------------------------------------------------
+; High score update: hi = max(hi, P1, P2).
+;----------------------------------------------------------------------------
+update_hiscore_06b2:
 06B2: 21 70 81    ld   hl,$8170
 06B5: 11 73 81    ld   de,$8173
-06B8: CD 39 07    call $0739
+06B8: CD 39 07    call compare_bcd3_0739
 06BB: 30 06       jr   nc,$06C3
 06BD: 21 70 81    ld   hl,$8170
 06C0: E5          push hl
@@ -1119,17 +1513,22 @@ update_scrolling_049c:
 06C3: 21 73 81    ld   hl,$8173
 06C6: E5          push hl
 06C7: 11 6D 81    ld   de,$816D
-06CA: CD 39 07    call $0739
+06CA: CD 39 07    call compare_bcd3_0739
 06CD: E1          pop  hl
 06CE: D0          ret  nc
 06CF: 2B          dec  hl
 06D0: 2B          dec  hl
-06D1: 11 6B 81    ld   de,$816B
+06D1: 11 6B 81    ld   de,hiscore_816b
 06D4: 01 03 00    ld   bc,$0003
 06D7: ED B0       ldir
 06D9: C9          ret
-06DA: 21 4B 84    ld   hl,$844B
-06DD: 3A 56 81    ld   a,($8156)
+
+;----------------------------------------------------------------------------
+; Extra life check: score >= 10000/20000/30000 (DSW3) and not yet awarded -> lives+1, sound $C0.
+;----------------------------------------------------------------------------
+check_extra_life_06da:
+06DA: 21 4B 84    ld   hl,bonus_life_flags_844b
+06DD: 3A 56 81    ld   a,(cur_player_8156)
 06E0: A7          and  a
 06E1: 28 05       jr   z,$06E8
 06E3: CB 7E       bit  7,(hl)
@@ -1151,34 +1550,37 @@ update_scrolling_049c:
 06FF: 23          inc  hl
 0700: 23          inc  hl
 0701: 23          inc  hl
-0702: 3A 56 81    ld   a,($8156)
+0702: 3A 56 81    ld   a,(cur_player_8156)
 0705: A7          and  a
 0706: 28 05       jr   z,$070D
 0708: 11 70 81    ld   de,$8170
 070B: 18 03       jr   $0710
 070D: 11 73 81    ld   de,$8173
-0710: CD 39 07    call $0739
+0710: CD 39 07    call compare_bcd3_0739    ; score >= threshold ?
 0713: D8          ret  c
-0714: 21 4B 84    ld   hl,$844B
-0717: 3A 56 81    ld   a,($8156)
+0714: 21 4B 84    ld   hl,bonus_life_flags_844b
+0717: 3A 56 81    ld   a,(cur_player_8156)
 071A: A7          and  a
 071B: 28 04       jr   z,$0721
 071D: CB FE       set  7,(hl)
 071F: 18 02       jr   $0723
 0721: CB F6       set  6,(hl)
-0723: CD 81 0B    call $0B81
-0726: 34          inc  (hl)
+0723: CD 81 0B    call get_lives_ptr_0b81
+0726: 34          inc  (hl)                 ; one more life
 0727: 3E C0       ld   a,$C0
-0729: 32 0B D5    ld   ($D50B),a
-072C: CD 6A 06    call $066A
+0729: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $C0 - sound: extra life
+072C: CD 6A 06    call draw_lives_066a
 072F: C9          ret
-0730: 00          nop
-0731: 00          nop
-0732: 01 00 00    ld   bc,$0000
-0735: 02          ld   (bc),a
-0736: 00          nop
-0737: 00          nop
-0738: 03          inc  bc
+
+;----------------------------------------------------------------------------
+; DATA: extra life thresholds, 3 BCD bytes each, read backwards (010000, 020000, 030000)
+;----------------------------------------------------------------------------
+table_extra_life_scores_0730:
+
+;----------------------------------------------------------------------------
+; Compare 3-byte BCD (DE) with (HL), both pointing to the MSB. CF=1 if (DE) < (HL).
+;----------------------------------------------------------------------------
+compare_bcd3_0739:
 0739: 06 03       ld   b,$03
 073B: 1A          ld   a,(de)
 073C: BE          cp   (hl)
@@ -1187,12 +1589,17 @@ update_scrolling_049c:
 073F: 2B          dec  hl
 0740: 10 F9       djnz $073B
 0742: C9          ret
-0743: 3A 56 81    ld   a,($8156)
+
+;----------------------------------------------------------------------------
+; Add 3-byte BCD at (HL) to the current player's score.
+;----------------------------------------------------------------------------
+add_score_0743:
+0743: 3A 56 81    ld   a,(cur_player_8156)
 0746: A7          and  a
 0747: 28 05       jr   z,$074E
-0749: 11 6E 81    ld   de,$816E
+0749: 11 6E 81    ld   de,p1_score_816e
 074C: 18 03       jr   $0751
-074E: 11 71 81    ld   de,$8171
+074E: 11 71 81    ld   de,p2_score_8171
 0751: 06 03       ld   b,$03
 0753: AF          xor  a
 0754: 1A          ld   a,(de)
@@ -1203,19 +1610,28 @@ update_scrolling_049c:
 0759: 23          inc  hl
 075A: 10 F8       djnz $0754
 075C: C9          ret
-075D: 3A 56 81    ld   a,($8156)
+
+;----------------------------------------------------------------------------
+; 075D: subtract (HL) from current score. 076D: subtract (HL) from the current bonus timer. CF=1 (and value zeroed) on underflow.
+;----------------------------------------------------------------------------
+sub_score_075d:
+075D: 3A 56 81    ld   a,(cur_player_8156)
 0760: A7          and  a
 0761: 28 05       jr   z,$0768
-0763: 11 6E 81    ld   de,$816E
-0766: 18 13       jr   $077B
-0768: 11 71 81    ld   de,$8171
-076B: 18 0E       jr   $077B
-076D: 3A 56 81    ld   a,($8156)
+0763: 11 6E 81    ld   de,p1_score_816e
+0766: 18 13       jr   sub_bcd3_077b
+0768: 11 71 81    ld   de,p2_score_8171
+076B: 18 0E       jr   sub_bcd3_077b
+
+sub_bonus_timer_076d:
+076D: 3A 56 81    ld   a,(cur_player_8156)
 0770: A7          and  a
 0771: 28 05       jr   z,$0778
-0773: 11 2E 84    ld   de,$842E
-0776: 18 03       jr   $077B
+0773: 11 2E 84    ld   de,bonus_timer_842e
+0776: 18 03       jr   sub_bcd3_077b
 0778: 11 31 84    ld   de,$8431
+
+sub_bcd3_077b:
 077B: 06 03       ld   b,$03
 077D: AF          xor  a
 077E: 1A          ld   a,(de)
@@ -1236,174 +1652,233 @@ update_scrolling_049c:
 078F: 12          ld   (de),a
 0790: 37          scf
 0791: C9          ret
+
+;----------------------------------------------------------------------------
+; Copy B bytes (HL)->(DE) inverted (CPL). Used to load the palette RAM.
+;----------------------------------------------------------------------------
+copy_inverted_0792:
 0792: 7E          ld   a,(hl)
 0793: 2F          cpl
 0794: 12          ld   (de),a
 0795: 23          inc  hl
 0796: 13          inc  de
-0797: 10 F9       djnz $0792
+0797: 10 F9       djnz copy_inverted_0792
 0799: C9          ret
+
+;----------------------------------------------------------------------------
+; Copy BC bytes from the GRAPHICS ROMs (address HL, via $D509/$D404) to
+; char RAM (DE). A read of $FF is retried up to 4 times (hardware glitch
+; workaround). Each byte is written twice.
+;----------------------------------------------------------------------------
+copy_gfxrom_to_charram_079a:
 079A: 08          ex   af,af'
 079B: AF          xor  a
 079C: 08          ex   af,af'
-079D: 22 09 D5    ld   ($D509),hl
-07A0: 3A 04 D4    ld   a,($D404)
-07A3: FE FF       cp   $FF
+079D: 22 09 D5    ld   (gfxrom_addr_d509),hl
+07A0: 3A 04 D4    ld   a,(gfxrom_data_d404) ; read gfx ROM
+07A3: FE FF       cp   $FF                  ; $FF -> retry (up to 4 times)
 07A5: 20 07       jr   nz,$07AE
 07A7: 08          ex   af,af'
 07A8: 3C          inc  a
 07A9: FE 04       cp   $04
 07AB: 38 EF       jr   c,$079C
 07AD: 08          ex   af,af'
-07AE: 12          ld   (de),a
+07AE: 12          ld   (de),a               ; char RAM written twice
 07AF: 12          ld   (de),a
 07B0: 13          inc  de
 07B1: 23          inc  hl
 07B2: 0B          dec  bc
 07B3: 78          ld   a,b
 07B4: B1          or   c
-07B5: 20 E3       jr   nz,$079A
+07B5: 20 E3       jr   nz,copy_gfxrom_to_charram_079a
 07B7: C9          ret
+
+;----------------------------------------------------------------------------
+; Copy graphics ROM $6000-$6EFF to char RAM $A800/$B000/$B800 (sprite/font banks) and clear the last char of each bank.
+;----------------------------------------------------------------------------
+load_sprite_charset_07b8:
 07B8: 21 00 60    ld   hl,$6000
 07BB: 11 00 A8    ld   de,$A800
 07BE: 01 00 05    ld   bc,$0500
-07C1: CD 9A 07    call $079A
+07C1: CD 9A 07    call copy_gfxrom_to_charram_079a
 07C4: 21 00 65    ld   hl,$6500
 07C7: 11 00 B0    ld   de,$B000
 07CA: 01 00 05    ld   bc,$0500
-07CD: CD 9A 07    call $079A
+07CD: CD 9A 07    call copy_gfxrom_to_charram_079a
 07D0: 21 00 6A    ld   hl,$6A00
 07D3: 11 00 B8    ld   de,$B800
 07D6: 01 00 05    ld   bc,$0500
-07D9: CD 9A 07    call $079A
+07D9: CD 9A 07    call copy_gfxrom_to_charram_079a
 07DC: 21 E0 AF    ld   hl,$AFE0
 07DF: 01 20 00    ld   bc,$0020
-07E2: CD EA 03    call $03EA
+07E2: CD EA 03    call clear_mem_double_03ea
 07E5: 21 E0 B7    ld   hl,$B7E0
 07E8: 01 20 00    ld   bc,$0020
-07EB: CD EA 03    call $03EA
+07EB: CD EA 03    call clear_mem_double_03ea
 07EE: 21 E0 BF    ld   hl,$BFE0
 07F1: 01 20 00    ld   bc,$0020
-07F4: CD EA 03    call $03EA
+07F4: CD EA 03    call clear_mem_double_03ea
 07F7: C9          ret
+
+;----------------------------------------------------------------------------
+; Screen off, then choose the screen flip: cocktail + player 1 -> flip 3,
+; else DSW1 flip dip. Sets the sprite adjust ($841B), resets the layer
+; scroll, video mode layer 1 only.
+;----------------------------------------------------------------------------
+init_screen_orientation_07f8:
 07F8: 06 00       ld   b,$00
-07FA: CD D8 02    call $02D8
-07FD: 3A 59 81    ld   a,($8159)
+07FA: CD D8 02    call vec_set_video_enable_02d8
+07FD: 3A 59 81    ld   a,(dsw_cocktail_8159)
 0800: A7          and  a
 0801: 28 3B       jr   z,$083E
-0803: 3A 56 81    ld   a,($8156)
+0803: 3A 56 81    ld   a,(cur_player_8156)
 0806: A7          and  a
 0807: 28 25       jr   z,$082E
 0809: 3E 03       ld   a,$03
-080B: 32 57 81    ld   ($8157),a
+080B: 32 57 81    ld   (flip_bits_8157),a
 080E: 47          ld   b,a
-080F: CD 74 08    call $0874
+080F: CD 74 08    call set_screen_flip_0874
 0812: 00          nop
 0813: 00          nop
 0814: 00          nop
-0815: CD 46 08    call $0846
+0815: CD 46 08    call set_sprite_adjust_ff_0846
 0818: 21 00 10    ld   hl,$1000
-081B: 22 F9 82    ld   ($82F9),hl
+081B: 22 F9 82    ld   (scroll_logical_82f9),hl
 081E: 21 00 00    ld   hl,$0000
-0821: 22 FB 82    ld   ($82FB),hl
+0821: 22 FB 82    ld   (scroll_l2_x_82fb),hl
 0824: 22 FD 82    ld   ($82FD),hl
-0827: CD 9F 12    call $129F
-082A: CD AE 04    call $04AE
+0827: CD 9F 12    call compute_scroll_regs_129f
+082A: CD AE 04    call video_layer1_only_04ae
 082D: C9          ret
 082E: 3E 00       ld   a,$00
-0830: 32 57 81    ld   ($8157),a
+0830: 32 57 81    ld   (flip_bits_8157),a
 0833: 47          ld   b,a
-0834: CD 74 08    call $0874
+0834: CD 74 08    call set_screen_flip_0874
 0837: 3E 01       ld   a,$01
-0839: CD 48 08    call $0848
+0839: CD 48 08    call set_sprite_adjust_0848
 083C: 18 DA       jr   $0818
-083E: 3A 58 81    ld   a,($8158)
+083E: 3A 58 81    ld   a,(dsw_flip_8158)
 0841: A7          and  a
 0842: 20 C5       jr   nz,$0809
 0844: 18 E8       jr   $082E
+
+set_sprite_adjust_ff_0846:
 0846: 3E FF       ld   a,$FF
-0848: 32 1B 84    ld   ($841B),a
+
+set_sprite_adjust_0848:
+0848: 32 1B 84    ld   (sprite_adjust_841b),a
 084B: C9          ret
-084C: 21 25 84    ld   hl,$8425
-084F: 3A 56 81    ld   a,($8156)
+
+;----------------------------------------------------------------------------
+; 2 player game: switch to the other player if he still has lives.
+;----------------------------------------------------------------------------
+switch_player_084c:
+084C: 21 25 84    ld   hl,lives_8425
+084F: 3A 56 81    ld   a,(cur_player_8156)
 0852: A7          and  a
 0853: 28 01       jr   z,$0856
 0855: 23          inc  hl
 0856: 7E          ld   a,(hl)
 0857: A7          and  a
 0858: C8          ret  z
-0859: 3A 56 81    ld   a,($8156)
+0859: 3A 56 81    ld   a,(cur_player_8156)
 085C: 2F          cpl
 085D: E6 03       and  $03
-085F: 32 56 81    ld   ($8156),a
+085F: 32 56 81    ld   (cur_player_8156),a
 0862: AF          xor  a
-0863: 32 74 81    ld   ($8174),a
+0863: 32 74 81    ld   (pending_score_ticks_8174),a
 0866: C9          ret
-0867: 3A D7 81    ld   a,($81D7)
+
+;----------------------------------------------------------------------------
+; Set video mode enable bits: $D600 = ($81D7 & $0F) | B.  (B: $10/$20/$40 layers 1-3, $80 sprites)
+;----------------------------------------------------------------------------
+set_video_enable_0867:
+0867: 3A D7 81    ld   a,(video_mode_shadow_81d7)
 086A: E6 0F       and  $0F
 086C: B0          or   b
-086D: 32 D7 81    ld   ($81D7),a
-0870: 32 00 D6    ld   ($D600),a
+086D: 32 D7 81    ld   (video_mode_shadow_81d7),a
+0870: 32 00 D6    ld   (video_mode_d600),a
 0873: C9          ret
-0874: 3A D7 81    ld   a,($81D7)
+
+;----------------------------------------------------------------------------
+; Set video mode flip bits: $D600 = ($81D7 & $FC) | B.
+;----------------------------------------------------------------------------
+set_screen_flip_0874:
+0874: 3A D7 81    ld   a,(video_mode_shadow_81d7)
 0877: E6 FC       and  $FC
 0879: 18 F1       jr   $086C
-087B: 21 0A D4    ld   hl,$D40A
+
+;----------------------------------------------------------------------------
+; Read DSW1 -> $8159 cocktail, $8158 flip, $815A finish bonus, $815B lives.
+;----------------------------------------------------------------------------
+read_dsw1_087b:
+087B: 21 0A D4    ld   hl,dsw1_d40a
 087E: AF          xor  a
 087F: CB 7E       bit  7,(hl)
 0881: 28 02       jr   z,$0885
 0883: 3E 03       ld   a,$03
-0885: 32 59 81    ld   ($8159),a
+0885: 32 59 81    ld   (dsw_cocktail_8159),a
 0888: AF          xor  a
 0889: CB 76       bit  6,(hl)
 088B: 20 02       jr   nz,$088F
 088D: 3E 03       ld   a,$03
-088F: 32 58 81    ld   ($8158),a
+088F: 32 58 81    ld   (dsw_flip_8158),a
 0892: 7E          ld   a,(hl)
 0893: 2F          cpl
 0894: 47          ld   b,a
 0895: E6 03       and  $03
-0897: 32 5A 81    ld   ($815A),a
+0897: 32 5A 81    ld   (dsw_finish_bonus_815a),a
 089A: 78          ld   a,b
 089B: 0F          rrca
 089C: 0F          rrca
 089D: 0F          rrca
 089E: E6 03       and  $03
-08A0: 32 5B 81    ld   ($815B),a
+08A0: 32 5B 81    ld   (dsw_lives_815b),a
 08A3: C9          ret
+
+;----------------------------------------------------------------------------
+; Read AY#0 port A = DSW2 (coinage).  08B7: port B = DSW3.
+;----------------------------------------------------------------------------
+read_dsw2_08a4:
 08A4: 3E 07       ld   a,$07
-08A6: 32 0E D4    ld   ($D40E),a
+08A6: 32 0E D4    ld   (ay0_addr_d40e),a
 08A9: 3E 38       ld   a,$38
-08AB: 32 0F D4    ld   ($D40F),a
+08AB: 32 0F D4    ld   (ay0_data_d40f),a
 08AE: 3E 0E       ld   a,$0E
-08B0: 32 0E D4    ld   ($D40E),a
-08B3: 3A 0F D4    ld   a,($D40F)
+08B0: 32 0E D4    ld   (ay0_addr_d40e),a
+08B3: 3A 0F D4    ld   a,(ay0_data_d40f)
 08B6: C9          ret
+
+read_dsw3_08b7:
 08B7: 3E 07       ld   a,$07
-08B9: 32 0E D4    ld   ($D40E),a
+08B9: 32 0E D4    ld   (ay0_addr_d40e),a
 08BC: 3E 38       ld   a,$38
-08BE: 32 0F D4    ld   ($D40F),a
+08BE: 32 0F D4    ld   (ay0_data_d40f),a
 08C1: 3E 0F       ld   a,$0F
-08C3: 32 0E D4    ld   ($D40E),a
-08C6: 3A 0F D4    ld   a,($D40F)
+08C3: 32 0E D4    ld   (ay0_addr_d40e),a
+08C6: 3A 0F D4    ld   a,(ay0_data_d40f)
 08C9: C9          ret
 
-08CA: 21 5E 81    ld   hl,$815E
+;----------------------------------------------------------------------------
+; Coin/dip init: coinage A/B, bonus life, infinite lives, year display, coin slot B.
+;----------------------------------------------------------------------------
+init_coinage_and_dips_08ca:
+08CA: 21 5E 81    ld   hl,coin3_latch_815e
 08CD: 36 00       ld   (hl),$00
-08CF: 11 5F 81    ld   de,$815F
+08CF: 11 5F 81    ld   de,coin1_latch_815f
 08D2: 01 0D 00    ld   bc,$000D
 08D5: ED B0       ldir
 08D7: 3E 01       ld   a,$01
-08D9: 32 68 81    ld   ($8168),a
-08DC: 32 0E D5    ld   ($D50E),a
-08DF: CD A4 08    call $08A4
+08D9: 32 68 81    ld   (bank_latch_shadow_8168),a
+08DC: 32 0E D5    ld   (bank_coinlock_d50e),a
+08DF: CD A4 08    call read_dsw2_08a4
 08E2: 21 61 81    ld   hl,$8161
-08E5: CD 16 09    call $0916
-08E8: CD B7 08    call $08B7
+08E5: CD 16 09    call parse_coinage_nibble_0916
+08E8: CD B7 08    call read_dsw3_08b7
 08EB: 47          ld   b,a
 08EC: 2F          cpl
 08ED: E6 03       and  $03
-08EF: 32 4B 84    ld   ($844B),a
+08EF: 32 4B 84    ld   (bonus_life_flags_844b),a
 08F2: 78          ld   a,b
 08F3: 07          rlca
 08F4: 47          ld   b,a
@@ -1413,20 +1888,25 @@ update_scrolling_049c:
 08F9: 07          rlca
 08FA: 47          ld   b,a
 08FB: E6 01       and  $01
-08FD: 32 5C 81    ld   ($815C),a
+08FD: 32 5C 81    ld   (dsw_lives_limited_815c),a
 0900: 78          ld   a,b
 0901: 07          rlca
 0902: E6 01       and  $01
-0904: 32 5D 81    ld   ($815D),a
+0904: 32 5D 81    ld   (dsw_year_display_815d),a
 0907: F1          pop  af
-0908: 32 67 81    ld   ($8167),a
+0908: 32 67 81    ld   (dsw_coin_b_enabled_8167),a
 090B: C8          ret  z
-090C: CD A4 08    call $08A4
+090C: CD A4 08    call read_dsw2_08a4
 090F: 21 65 81    ld   hl,$8165
 0912: 0F          rrca
 0913: 0F          rrca
 0914: 0F          rrca
 0915: 0F          rrca
+
+;----------------------------------------------------------------------------
+; Decode a coinage nibble into (coins, credits) at (HL).
+;----------------------------------------------------------------------------
+parse_coinage_nibble_0916:
 0916: E6 0F       and  $0F
 0918: CB 5F       bit  3,a
 091A: 28 09       jr   z,$0925
@@ -1441,12 +1921,19 @@ update_scrolling_049c:
 0928: 23          inc  hl
 0929: 77          ld   (hl),a
 092A: C9          ret
-092B: 3A 68 81    ld   a,($8168)
-092E: 32 0E D5    ld   ($D50E),a
-0931: 3A 0C D4    ld   a,($D40C)
+
+;----------------------------------------------------------------------------
+; IRQ coin handler: writes the bank/coin latch, TILT -> reset, service coin,
+; coin A/B edge detection, sound $87, credits += n (max 9, then coin
+; lockout). In attract mode the credit digit is redrawn.
+;----------------------------------------------------------------------------
+irq_coin_handler_092b:
+092B: 3A 68 81    ld   a,(bank_latch_shadow_8168)
+092E: 32 0E D5    ld   (bank_coinlock_d50e),a
+0931: 3A 0C D4    ld   a,(in3_service_d40c)
 0934: CB 6F       bit  5,a
-0936: CA AA 09    jp   z,$09AA
-0939: 21 5E 81    ld   hl,$815E
+0936: CA AA 09    jp   z,tilt_reset_09aa
+0939: 21 5E 81    ld   hl,coin3_latch_815e
 093C: CB 67       bit  4,a
 093E: 28 03       jr   z,$0943
 0940: 36 01       ld   (hl),$01
@@ -1458,28 +1945,30 @@ update_scrolling_049c:
 0948: 77          ld   (hl),a
 0949: 3C          inc  a
 094A: 18 41       jr   $098D
-094C: 3A 68 81    ld   a,($8168)
-094F: 32 0E D5    ld   ($D50E),a
-0952: 21 5F 81    ld   hl,$815F
-0955: 3A 0B D4    ld   a,($D40B)
+094C: 3A 68 81    ld   a,(bank_latch_shadow_8168)
+094F: 32 0E D5    ld   (bank_coinlock_d50e),a
+0952: 21 5F 81    ld   hl,coin1_latch_815f
+0955: 3A 0B D4    ld   a,(in2_coin_start_d40b)
 0958: CB 6F       bit  5,a
-095A: CD 70 09    call $0970
-095D: 3A 67 81    ld   a,($8167)
+095A: CD 70 09    call coin_input_edge_0970
+095D: 3A 67 81    ld   a,(dsw_coin_b_enabled_8167)
 0960: A7          and  a
 0961: C8          ret  z
-0962: 3A 68 81    ld   a,($8168)
-0965: 32 0E D5    ld   ($D50E),a
-0968: 21 63 81    ld   hl,$8163
-096B: 3A 0B D4    ld   a,($D40B)
+0962: 3A 68 81    ld   a,(bank_latch_shadow_8168)
+0965: 32 0E D5    ld   (bank_coinlock_d50e),a
+0968: 21 63 81    ld   hl,coin2_latch_8163
+096B: 3A 0B D4    ld   a,(in2_coin_start_d40b)
 096E: CB 67       bit  4,a
+
+coin_input_edge_0970:
 0970: 28 03       jr   z,$0975
 0972: 36 01       ld   (hl),$01
 0974: C9          ret
 0975: 7E          ld   a,(hl)
 0976: A7          and  a
 0977: C8          ret  z
-0978: 3E 87       ld   a,$87
-097A: 32 0B D5    ld   ($D50B),a
+0978: 3E 87       ld   a,$87                ; sound: coin
+097A: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $87
 097D: AF          xor  a
 097E: 77          ld   (hl),a
 097F: 23          inc  hl
@@ -1495,15 +1984,15 @@ update_scrolling_049c:
 098A: 23          inc  hl
 098B: 23          inc  hl
 098C: 7E          ld   a,(hl)
-098D: 21 69 81    ld   hl,$8169
+098D: 21 69 81    ld   hl,credits_8169
 0990: 86          add  a,(hl)
 0991: 27          daa
 0992: FE 09       cp   $09
 0994: 38 05       jr   c,$099B
-0996: CD A2 0C    call $0CA2
+0996: CD A2 0C    call lockout_coins_0ca2   ; credits full -> coin lockout
 0999: 3E 09       ld   a,$09
 099B: 77          ld   (hl),a
-099C: 3A 2B 84    ld   a,($842B)
+099C: 3A 2B 84    ld   a,(attract_mode_842b)
 099F: A7          and  a
 09A0: C8          ret  z
 09A1: 7E          ld   a,(hl)
@@ -1512,12 +2001,22 @@ update_scrolling_049c:
 09A7: 77          ld   (hl),a
 09A8: 77          ld   (hl),a
 09A9: C9          ret
-09AA: CD A2 0C    call $0CA2
-09AD: CD 8D 04    call $048D
+
+;----------------------------------------------------------------------------
+; TILT: print 'TILT', wait, reset.
+;----------------------------------------------------------------------------
+tilt_reset_09aa:
+09AA: CD A2 0C    call lockout_coins_0ca2
+09AD: CD 8D 04    call clear_layer1_048d
 09B0: 21 CA 09    ld   hl,$09CA
 09B3: 11 AE C5    ld   de,$C5AE
 09B6: 01 04 00    ld   bc,$0004
 09B9: ED B0       ldir
+
+;----------------------------------------------------------------------------
+; Delay (4 x 65536 loops) then jp $0003 (reset).
+;----------------------------------------------------------------------------
+delay_and_reset_09bb:
 09BB: 06 04       ld   b,$04
 09BD: 21 00 00    ld   hl,$0000
 09C0: 2B          dec  hl
@@ -1525,54 +2024,62 @@ update_scrolling_049c:
 09C2: B5          or   l
 09C3: 20 FB       jr   nz,$09C0
 09C5: 10 F6       djnz $09BD
-09C7: C3 03 00    jp   $0003
-09CA: 1D          dec  e
-09CB: 12          ld   (de),a
-09CC: 15          dec  d
-09CD: 1D          dec  e
+09C7: C3 03 00    jp   $0003                ; reset
+
+;----------------------------------------------------------------------------
+; System init (once at boot): default high score, dips, coinage, AY#0,
+; player=1, palette from $7900, colour banks, scroll registers from $7F40,
+; clear all layers, column scroll, sprites, screen orientation.
+;----------------------------------------------------------------------------
+system_init_09ce:
 09CE: 21 00 50    ld   hl,$5000
-09D1: 22 6B 81    ld   ($816B),hl
+09D1: 22 6B 81    ld   (hiscore_816b),hl
 09D4: AF          xor  a
 09D5: 32 6D 81    ld   ($816D),a
-09D8: CD 7B 08    call $087B
-09DB: CD CA 08    call $08CA
-09DE: CD D0 0B    call $0BD0
+09D8: CD 7B 08    call read_dsw1_087b
+09DB: CD CA 08    call init_coinage_and_dips_08ca
+09DE: CD D0 0B    call ay0_init_0bd0
 09E1: 3E 03       ld   a,$03
-09E3: 32 56 81    ld   ($8156),a
-09E6: 21 00 79    ld   hl,$7900
-09E9: 11 00 D2    ld   de,$D200
+09E3: 32 56 81    ld   (cur_player_8156),a
+09E6: 21 00 79    ld   hl,$7900             ; palette from banked ROM $7900 (inverted)
+09E9: 11 00 D2    ld   de,paletteram_d200
 09EC: 01 80 00    ld   bc,$0080
 09EF: 41          ld   b,c
-09F0: CD 92 07    call $0792
+09F0: CD 92 07    call copy_inverted_0792
 09F3: 3E 29       ld   a,$29
-09F5: 32 D5 81    ld   ($81D5),a
+09F5: 32 D5 81    ld   (colorbank_shadow_81d5),a
 09F8: 3E 03       ld   a,$03
 09FA: 32 D6 81    ld   ($81D6),a
 09FD: AF          xor  a
-09FE: 32 1F 84    ld   ($841F),a
-0A01: 21 40 7F    ld   hl,$7F40
-0A04: 11 00 D5    ld   de,$D500
+09FE: 32 1F 84    ld   (palette_upload_841f),a
+0A01: 21 40 7F    ld   hl,$7F40             ; initial scroll/colour/latch registers from $7F40
+0A04: 11 00 D5    ld   de,scroll_regs_d500
 0A07: 01 10 00    ld   bc,$0010
 0A0A: ED B0       ldir
-0A0C: CD 8D 04    call $048D
+0A0C: CD 8D 04    call clear_layer1_048d
+
+;----------------------------------------------------------------------------
+; Clear layers 2+3, column scroll shadows, sprite shadow (Y=$3F -> hidden), orientation. Used at every life/stage start.
+;----------------------------------------------------------------------------
+init_playfield_0a0f:
 0A0F: 21 00 C8    ld   hl,$C800
 0A12: 36 FF       ld   (hl),$FF
 0A14: 11 01 C8    ld   de,$C801
 0A17: 01 FF 07    ld   bc,$07FF
 0A1A: ED B0       ldir
-0A1C: 21 75 81    ld   hl,$8175
+0A1C: 21 75 81    ld   hl,colscroll_l1_8175
 0A1F: 36 00       ld   (hl),$00
 0A21: 11 76 81    ld   de,$8176
 0A24: 01 5F 00    ld   bc,$005F
 0A27: ED B0       ldir
-0A29: 21 1C 84    ld   hl,$841C
+0A29: 21 1C 84    ld   hl,colscroll_dirty_841c
 0A2C: 3E 01       ld   a,$01
 0A2E: 77          ld   (hl),a
 0A2F: 23          inc  hl
 0A30: 77          ld   (hl),a
 0A31: 23          inc  hl
 0A32: 77          ld   (hl),a
-0A33: 21 BB 83    ld   hl,$83BB
+0A33: 21 BB 83    ld   hl,sprite_shadow_83bb
 0A36: E5          push hl
 0A37: AF          xor  a
 0A38: 77          ld   (hl),a
@@ -1586,25 +2093,32 @@ update_scrolling_049c:
 0A41: 11 BF 83    ld   de,$83BF
 0A44: 01 5C 00    ld   bc,$005C
 0A47: ED B0       ldir
-0A49: CD F8 07    call $07F8
+0A49: CD F8 07    call init_screen_orientation_07f8
 0A4C: AF          xor  a
-0A4D: 32 00 D3    ld   ($D300),a
+0A4D: 32 00 D3    ld   (priority_d300),a
 0A50: C9          ret
+
+;----------------------------------------------------------------------------
+; New game: clears attract flag, bonus life flags, timers; lives from DSW
+; (table 0AC6, $FF = infinite), level=1 and round=1 for both players,
+; bonus timer = 5000, scores = 0, redraw header.
+;----------------------------------------------------------------------------
+new_game_init_0a51:
 0A51: 21 00 00    ld   hl,$0000
-0A54: 22 2B 84    ld   ($842B),hl
-0A57: 21 4B 84    ld   hl,$844B
+0A54: 22 2B 84    ld   (attract_mode_842b),hl
+0A57: 21 4B 84    ld   hl,bonus_life_flags_844b
 0A5A: CB BE       res  7,(hl)
 0A5C: CB B6       res  6,(hl)
-0A5E: 21 2E 84    ld   hl,$842E
+0A5E: 21 2E 84    ld   hl,bonus_timer_842e
 0A61: 36 00       ld   (hl),$00
 0A63: 11 2F 84    ld   de,$842F
 0A66: 01 0A 00    ld   bc,$000A
 0A69: ED B0       ldir
 0A6B: 21 C6 0A    ld   hl,$0AC6
-0A6E: 3A 5C 81    ld   a,($815C)
+0A6E: 3A 5C 81    ld   a,(dsw_lives_limited_815c)
 0A71: A7          and  a
 0A72: 28 12       jr   z,$0A86
-0A74: 3A 5B 81    ld   a,($815B)
+0A74: 3A 5B 81    ld   a,(dsw_lives_815b)
 0A77: A7          and  a
 0A78: 28 0B       jr   z,$0A85
 0A7A: FE 01       cp   $01
@@ -1617,15 +2131,15 @@ update_scrolling_049c:
 0A85: 23          inc  hl
 0A86: 00          nop
 0A87: 7E          ld   a,(hl)
-0A88: 32 25 84    ld   ($8425),a
+0A88: 32 25 84    ld   (lives_8425),a
 0A8B: 32 26 84    ld   ($8426),a
 0A8E: 21 01 01    ld   hl,$0101
-0A91: 22 27 84    ld   ($8427),hl
-0A94: 22 29 84    ld   ($8429),hl
+0A91: 22 27 84    ld   (level_8427),hl
+0A94: 22 29 84    ld   (round_8429),hl
 0A97: 2A CB 0A    ld   hl,($0ACB)
-0A9A: 22 2E 84    ld   ($842E),hl
+0A9A: 22 2E 84    ld   (bonus_timer_842e),hl
 0A9D: 22 31 84    ld   ($8431),hl
-0AA0: 21 6E 81    ld   hl,$816E
+0AA0: 21 6E 81    ld   hl,p1_score_816e
 0AA3: 36 00       ld   (hl),$00
 0AA5: 11 6F 81    ld   de,$816F
 0AA8: 01 06 00    ld   bc,$0006
@@ -1633,47 +2147,55 @@ update_scrolling_049c:
 0AAD: 21 55 C4    ld   hl,$C455
 0AB0: 01 2B 00    ld   bc,$002B
 0AB3: 3E FF       ld   a,$FF
-0AB5: CD EB 03    call $03EB
-0AB8: 3A 6A 81    ld   a,($816A)
+0AB5: CD EB 03    call fill_mem_double_03eb
+0AB8: 3A 6A 81    ld   a,(two_player_game_816a)
 0ABB: A7          and  a
-0ABC: C4 03 05    call nz,$0503
-0ABF: CD 33 04    call $0433
-0AC2: CD 99 06    call $0699
+0ABC: C4 03 05    call nz,draw_p2_header_0503
+0ABF: CD 33 04    call draw_p1_score_0433
+0AC2: CD 99 06    call draw_bonus_label_0699
 0AC5: C9          ret
-0AC6: FF          rst  $38
-0AC7: 03          inc  bc
-0AC8: 04          inc  b
-0AC9: 05          dec  b
-0ACA: 06 00       ld   b,$00
-0ACC: 50          ld   d,b
-0ACD: 3A 2B 84    ld   a,($842B)
+
+;----------------------------------------------------------------------------
+; DATA: lives table ($FF=infinite, 3,4,5,6) + word $5000 = initial bonus timer
+;----------------------------------------------------------------------------
+table_lives_0ac6:
+
+;----------------------------------------------------------------------------
+; IRQ video update: timer display (not in attract), pending score, watchdog,
+; hardware scroll regs, sprites ($83BB -> $D100, 64 bytes, and $83FB ->
+; $D160: HW sprites $10-$17 do not exist), column scroll of the 3 layers when
+; flagged, palette upload when requested, colour banks, stage 2 status line +
+; water surface ($835A==0), new background columns (1111) if $835A b7=0.
+;----------------------------------------------------------------------------
+irq_video_update_0acd:
+0ACD: 3A 2B 84    ld   a,(attract_mode_842b)
 0AD0: A7          and  a
 0AD1: 20 06       jr   nz,$0AD9
-0AD3: CD 45 04    call $0445
-0AD6: CD 8D 10    call $108D
-0AD9: 32 0D D5    ld   ($D50D),a
-0ADC: 21 FF 82    ld   hl,$82FF
-0ADF: 11 00 D5    ld   de,$D500
+0AD3: CD 45 04    call draw_bonus_timer_0445
+0AD6: CD 8D 10    call task06_award_pending_score_108d
+0AD9: 32 0D D5    ld   (watchdog_d50d),a    ; kick watchdog
+0ADC: 21 FF 82    ld   hl,scroll_hw_shadow_82ff
+0ADF: 11 00 D5    ld   de,scroll_regs_d500
 0AE2: 01 06 00    ld   bc,$0006
 0AE5: ED B0       ldir
-0AE7: 21 BB 83    ld   hl,$83BB
-0AEA: 11 00 D1    ld   de,$D100
+0AE7: 21 BB 83    ld   hl,sprite_shadow_83bb  ; sprite shadow -> sprite RAM (HW sprites 0-15)
+0AEA: 11 00 D1    ld   de,spriteram_d100
 0AED: 01 40 00    ld   bc,$0040
 0AF0: ED B0       ldir
-0AF2: 11 60 D1    ld   de,$D160
+0AF2: 11 60 D1    ld   de,$D160             ; -> HW sprites $18-$1F ($D140-$D15F are not sprites)
 0AF5: 01 20 00    ld   bc,$0020
 0AF8: ED B0       ldir
-0AFA: 3A 1C 84    ld   a,($841C)
+0AFA: 3A 1C 84    ld   a,(colscroll_dirty_841c)
 0AFD: A7          and  a
 0AFE: 28 0B       jr   z,$0B0B
-0B00: 21 75 81    ld   hl,$8175
-0B03: 11 00 D0    ld   de,$D000
+0B00: 21 75 81    ld   hl,colscroll_l1_8175
+0B03: 11 00 D0    ld   de,colscroll_d000
 0B06: 01 20 00    ld   bc,$0020
 0B09: ED B0       ldir
 0B0B: 3A 1D 84    ld   a,($841D)
 0B0E: A7          and  a
 0B0F: 28 11       jr   z,$0B22
-0B11: 21 95 81    ld   hl,$8195
+0B11: 21 95 81    ld   hl,colscroll_l2_8195
 0B14: 11 21 D0    ld   de,$D021
 0B17: 01 1F 00    ld   bc,$001F
 0B1A: ED B0       ldir
@@ -1682,11 +2204,11 @@ update_scrolling_049c:
 0B22: 3A 1E 84    ld   a,($841E)
 0B25: A7          and  a
 0B26: 28 0B       jr   z,$0B33
-0B28: 21 B5 81    ld   hl,$81B5
+0B28: 21 B5 81    ld   hl,colscroll_l3_81b5
 0B2B: 11 40 D0    ld   de,$D040
 0B2E: 01 20 00    ld   bc,$0020
 0B31: ED B0       ldir
-0B33: 21 1C 84    ld   hl,$841C
+0B33: 21 1C 84    ld   hl,colscroll_dirty_841c
 0B36: AF          xor  a
 0B37: 77          ld   (hl),a
 0B38: 23          inc  hl
@@ -1702,23 +2224,23 @@ update_scrolling_049c:
 0B43: 2A 21 84    ld   hl,($8421)
 0B46: EB          ex   de,hl
 0B47: 2A 23 84    ld   hl,($8423)
-0B4A: CD 92 07    call $0792
+0B4A: CD 92 07    call copy_inverted_0792
 0B4D: AF          xor  a
-0B4E: 32 1F 84    ld   ($841F),a
-0B51: 2A D5 81    ld   hl,($81D5)
-0B54: 22 06 D5    ld   ($D506),hl
-0B57: 3A 5A 83    ld   a,($835A)
+0B4E: 32 1F 84    ld   (palette_upload_841f),a
+0B51: 2A D5 81    ld   hl,(colorbank_shadow_81d5)
+0B54: 22 06 D5    ld   (colorbank_d506),hl
+0B57: 3A 5A 83    ld   a,(scroll_mode_835a)
 0B5A: A7          and  a
 0B5B: 20 1D       jr   nz,$0B7A
-0B5D: 21 58 84    ld   hl,$8458
+0B5D: 21 58 84    ld   hl,status_line_8458
 0B60: 11 B1 C4    ld   de,$C4B1
 0B63: 01 0C 00    ld   bc,$000C
 0B66: ED B0       ldir
-0B68: 21 37 84    ld   hl,$8437
-0B6B: 56          ld   d,(hl)
+0B68: 21 37 84    ld   hl,surface_anim_ptr_8437
+0B6B: 56          ld   d,(hl)               ; big-endian pointer
 0B6C: 23          inc  hl
 0B6D: 5E          ld   e,(hl)
-0B6E: 21 00 CD    ld   hl,$CD00
+0B6E: 21 00 CD    ld   hl,$CD00             ; water surface tiles (stage 2)
 0B71: 06 40       ld   b,$40
 0B73: 1A          ld   a,(de)
 0B74: 77          ld   (hl),a
@@ -1728,31 +2250,49 @@ update_scrolling_049c:
 0B78: 10 F9       djnz $0B73
 0B7A: E6 80       and  $80
 0B7C: C0          ret  nz
-0B7D: CD 11 11    call $1111
+0B7D: CD 11 11    call draw_new_bg_columns_1111  ; draw the new background columns
 0B80: C9          ret
-0B81: 21 25 84    ld   hl,$8425
-0B84: 3A 56 81    ld   a,($8156)
+
+;----------------------------------------------------------------------------
+; HL = &lives of the current player. 0B84: HL/DE += 1 if player 2 (per-player byte pairs).
+;----------------------------------------------------------------------------
+get_lives_ptr_0b81:
+0B81: 21 25 84    ld   hl,lives_8425
+
+select_player_ptr_0b84:
+0B84: 3A 56 81    ld   a,(cur_player_8156)
 0B87: A7          and  a
 0B88: C0          ret  nz
 0B89: 23          inc  hl
 0B8A: 13          inc  de
 0B8B: C9          ret
+
+;----------------------------------------------------------------------------
+; Palette load request (uploaded by the IRQ): 64 bytes to $D200 from the
+; table at $7D36 indexed by B (level) and C (round). 0B8C: fixed B=5 C=1.
+; NOTE: returns BC = the value pushed at 0B8F (0B8C clobbers BC).
+;----------------------------------------------------------------------------
+load_palette_default_0b8c:
 0B8C: 01 01 05    ld   bc,$0501
+
+load_palette_0b8f:
 0B8F: C5          push bc
-0B90: 21 1F 84    ld   hl,$841F
+0B90: 21 1F 84    ld   hl,palette_upload_841f
 0B93: 36 FF       ld   (hl),$FF
 0B95: 23          inc  hl
 0B96: 36 40       ld   (hl),$40
-0B98: 11 00 D2    ld   de,$D200
+0B98: 11 00 D2    ld   de,paletteram_d200
 0B9B: ED 53 21 84 ld   ($8421),de
 0B9F: 21 36 7D    ld   hl,$7D36
-0BA2: CD AE 0B    call $0BAE
+0BA2: CD AE 0B    call palette_table_index_0bae
 0BA5: 5E          ld   e,(hl)
 0BA6: 23          inc  hl
 0BA7: 56          ld   d,(hl)
 0BA8: ED 53 23 84 ld   ($8423),de
 0BAC: C1          pop  bc
 0BAD: C9          ret
+
+palette_table_index_0bae:
 0BAE: 78          ld   a,b
 0BAF: 07          rlca
 0BB0: 07          rlca
@@ -1764,71 +2304,100 @@ update_scrolling_049c:
 0BB8: 09          add  hl,bc
 0BB9: C9          ret
 
+;----------------------------------------------------------------------------
+; Controls -> $81D8 (skipped in attract mode, the demo script writes $81D8). Cocktail P2 uses IN1.
+;----------------------------------------------------------------------------
 read_joystick_0bba:
-0BBA: 3A 2B 84    ld   a,($842B)
+0BBA: 3A 2B 84    ld   a,(attract_mode_842b)
 0BBD: A7          and  a
 0BBE: C0          ret  nz
 0BBF: 21 08 D4    ld   hl,joy_port_1_d408
-0BC2: 3A 59 81    ld   a,($8159)
+0BC2: 3A 59 81    ld   a,(dsw_cocktail_8159)
 0BC5: A7          and  a
 0BC6: 28 03       jr   z,$0BCB
-0BC8: CD 84 0B    call $0B84
+0BC8: CD 84 0B    call select_player_ptr_0b84
 0BCB: 7E          ld   a,(hl)
-0BCC: 32 D8 81    ld   ($81D8),a
+0BCC: 32 D8 81    ld   (joystick_input_81d8),a
 0BCF: C9          ret
 
-0BD0: 3E C3       ld   a,$C3
-0BD2: 32 42 84    ld   ($8442),a
+;----------------------------------------------------------------------------
+; AY#0 init: RAM 'JP' opcode at $8442, all channels off, silence.
+;----------------------------------------------------------------------------
+ay0_init_0bd0:
+0BD0: 3E C3       ld   a,$C3                ; $C3 = JP opcode
+0BD2: 32 42 84    ld   (ay0_sfx_jp_8442),a
 0BD5: 21 07 3F    ld   hl,$3F07
-0BD8: 22 0E D4    ld   ($D40E),hl
+0BD8: 22 0E D4    ld   (ay0_addr_d40e),hl
+
+;----------------------------------------------------------------------------
+; Silence AY#0: stop request, clear regs 0-6 and 8-13.
+;----------------------------------------------------------------------------
+ay0_silence_0bdb:
 0BDB: 97          sub  a
-0BDC: 32 3B 84    ld   ($843B),a
+0BDC: 32 3B 84    ld   (ay0_sfx_request_843b),a
 0BDF: 06 07       ld   b,$07
 0BE1: 21 00 00    ld   hl,$0000
-0BE4: CD EC 0B    call $0BEC
+0BE4: CD EC 0B    call ay0_clear_regs_0bec
 0BE7: 06 0E       ld   b,$0E
 0BE9: 21 08 00    ld   hl,$0008
-0BEC: 22 0E D4    ld   ($D40E),hl
+
+ay0_clear_regs_0bec:
+0BEC: 22 0E D4    ld   (ay0_addr_d40e),hl
 0BEF: 2C          inc  l
 0BF0: 7D          ld   a,l
 0BF1: B8          cp   b
-0BF2: C2 EC 0B    jp   nz,$0BEC
+0BF2: C2 EC 0B    jp   nz,ay0_clear_regs_0bec
 0BF5: C9          ret
-0BF6: CD B0 0C    call $0CB0
-0BF9: CD 00 0C    call music_sequencer_0c00
-0BFC: CD A9 0C    call $0CA9
+
+;----------------------------------------------------------------------------
+; IRQ sound: ROM bank 1 in (effect data lives at $7xxx of kn60), run the AY#0 sequencer, bank 0 back.
+;----------------------------------------------------------------------------
+irq_sound_update_0bf6:
+0BF6: CD B0 0C    call select_rom_bank1_0cb0
+0BF9: CD 00 0C    call ay0_sfx_sequencer_0c00
+0BFC: CD A9 0C    call select_rom_bank0_0ca9
 0BFF: C9          ret
 
-music_sequencer_0c00:
-0C00: 21 45 84    ld   hl,$8445
+;----------------------------------------------------------------------------
+; (was 'music_sequencer_0c00') Simple AY#0 SOUND EFFECT sequencer running
+; on the main CPU (the music & most sounds are made by the sound CPU via
+; $D50B). Runs every 2nd frame. $843B: bit7 = new request ($80 stop,
+; $81/$82 = effect 1/2, index*3 into the table at $0C92: ptr, repeat count).
+; Data: [duration] ([reg][value])... ; $80 = end of pattern.
+; State handler called through the RAM "JP" at $8442.
+;----------------------------------------------------------------------------
+ay0_sfx_sequencer_0c00:
+0C00: 21 45 84    ld   hl,sfx_frame_toggle_8445
 0C03: 35          dec  (hl)
 0C04: CB 46       bit  0,(hl)
 0C06: C8          ret  z
 0C07: 21 3D 84    ld   hl,$843D
 0C0A: 35          dec  (hl)
-0C0B: 3A 3B 84    ld   a,($843B)
+0C0B: 3A 3B 84    ld   a,(ay0_sfx_request_843b)
 0C0E: A7          and  a
-0C0F: FA 19 0C    jp   m,$0C19
-0C12: C2 42 84    jp   nz,$8442
+0C0F: FA 19 0C    jp   m,ay0_sfx_start_0c19
+0C12: C2 42 84    jp   nz,$8442             ; jp to the current state handler via RAM "JP nnnn"
 0C15: 00          nop
 0C16: 00          nop
 0C17: 00          nop
 0C18: C9          ret
+
+ay0_sfx_start_0c19:
 0C19: FE 80       cp   $80
-0C1B: CA DB 0B    jp   z,$0BDB
+0C1B: CA DB 0B    jp   z,ay0_silence_0bdb
 0C1E: FE 83       cp   $83
-0C20: D2 DB 0B    jp   nc,$0BDB
+0C20: D2 DB 0B    jp   nc,ay0_silence_0bdb
 0C23: F5          push af
-0C24: CD DB 0B    call $0BDB
+0C24: CD DB 0B    call ay0_silence_0bdb
 0C27: F1          pop  af
 0C28: E6 7F       and  $7F
-0C2A: 32 3B 84    ld   ($843B),a
+0C2A: 32 3B 84    ld   (ay0_sfx_request_843b),a
 0C2D: 47          ld   b,a
 0C2E: 87          add  a,a
 0C2F: 80          add  a,b
 0C30: 5F          ld   e,a
 0C31: 16 00       ld   d,$00
-0C33: 21 92 0C    ld   hl,$0C92
+0C33: 21 92 0C    ld   hl,$0C92             ; effect table (index*3), data in bank 1 $7xxx
 0C36: 19          add  hl,de
 0C37: 5E          ld   e,(hl)
 0C38: 23          inc  hl
@@ -1844,25 +2413,29 @@ music_sequencer_0c00:
 0C49: 32 3D 84    ld   ($843D),a
 0C4C: 23          inc  hl
 0C4D: 7E          ld   a,(hl)
-0C4E: 32 0E D4    ld   ($D40E),a
+0C4E: 32 0E D4    ld   (ay0_addr_d40e),a
 0C51: 23          inc  hl
 0C52: FE 07       cp   $07
 0C54: 7E          ld   a,(hl)
 0C55: 20 02       jr   nz,$0C59
 0C57: E6 3F       and  $3F
-0C59: 32 0F D4    ld   ($D40F),a
+0C59: 32 0F D4    ld   (ay0_data_d40f),a
 0C5C: 23          inc  hl
 0C5D: 7E          ld   a,(hl)
 0C5E: A7          and  a
 0C5F: F2 4E 0C    jp   p,$0C4E
 0C62: 22 40 84    ld   ($8440),hl
-0C65: 21 6C 0C    ld   hl,$0C6C
-0C68: 22 43 84    ld   ($8443),hl
+0C65: 21 6C 0C    ld   hl,ay0_sfx_state_wait_0c6c
+0C68: 22 43 84    ld   ($8443),hl           ; next state handler
 0C6B: C9          ret
+
+ay0_sfx_state_wait_0c6c:
 0C6C: 3A 3D 84    ld   a,($843D)
 0C6F: A7          and  a
-0C70: 28 01       jr   z,$0C73
+0C70: 28 01       jr   z,ay0_sfx_state_next_0c73
 0C72: C9          ret
+
+ay0_sfx_state_next_0c73:
 0C73: 2A 40 84    ld   hl,($8440)
 0C76: 7E          ld   a,(hl)
 0C77: D6 80       sub  $80
@@ -1872,134 +2445,177 @@ music_sequencer_0c00:
 0C80: 28 07       jr   z,$0C89
 0C82: 3D          dec  a
 0C83: 32 3C 84    ld   ($843C),a
-0C86: CA DB 0B    jp   z,$0BDB
+0C86: CA DB 0B    jp   z,ay0_silence_0bdb
 0C89: 2A 3E 84    ld   hl,($843E)
 0C8C: 22 40 84    ld   ($8440),hl
-0C8F: 21 73 0C    ld   hl,$0C73
-0C92: C3 68 0C    jp   $0C68
+0C8F: 21 73 0C    ld   hl,ay0_sfx_state_next_0c73
+0C92: C3 68 0C    jp   $0C68                ; (also base of the effect table: entries at 0C95, 0C98)
 
-0C9E: F6 01       or   $01
-0CA0: 18 21       jr   $0CC3
-0CA2: 3A 68 81    ld   a,($8168)
+
+; Bank/coin latch helpers (shadow $8168 -> $D50E):
+; 0C9B enable coins (b0=1)   0CA2 lock out coins (b0=0)
+; 0CA9 ROM bank 0 (b7=0)     0CB0 ROM bank 1 (b7=1)
+; 0CB7 sound on  (b1=1)      0CBE sound off (b1=0)
+enable_coins_0c9b:
+0C9B: 3A 68 81    ld   a,(bank_latch_shadow_8168)
+enable_coins_tail_0c9e:
+0C9E: F6 01       or   $01                  ; b0 = 1 : coins accepted
+0CA0: 18 21       jr   write_bank_latch_0cc3
+
+lockout_coins_0ca2:
+0CA2: 3A 68 81    ld   a,(bank_latch_shadow_8168)
 0CA5: E6 FE       and  $FE
-0CA7: 18 1A       jr   $0CC3
-0CA9: 3A 68 81    ld   a,($8168)
+0CA7: 18 1A       jr   write_bank_latch_0cc3
+
+select_rom_bank0_0ca9:
+0CA9: 3A 68 81    ld   a,(bank_latch_shadow_8168)
 0CAC: E6 7F       and  $7F
-0CAE: 18 13       jr   $0CC3
-0CB0: 3A 68 81    ld   a,($8168)
+0CAE: 18 13       jr   write_bank_latch_0cc3
+
+select_rom_bank1_0cb0:
+0CB0: 3A 68 81    ld   a,(bank_latch_shadow_8168)
 0CB3: F6 80       or   $80
-0CB5: 18 0C       jr   $0CC3
-0CB7: 3A 68 81    ld   a,($8168)
+0CB5: 18 0C       jr   write_bank_latch_0cc3
+
+sound_unmute_0cb7:
+0CB7: 3A 68 81    ld   a,(bank_latch_shadow_8168)
 0CBA: F6 02       or   $02
-0CBC: 18 05       jr   $0CC3
-0CBE: 3A 68 81    ld   a,($8168)
+0CBC: 18 05       jr   write_bank_latch_0cc3
+
+sound_mute_0cbe:
+0CBE: 3A 68 81    ld   a,(bank_latch_shadow_8168)
 0CC1: E6 FD       and  $FD
-0CC3: 32 68 81    ld   ($8168),a
-0CC6: 32 0E D5    ld   ($D50E),a
+
+write_bank_latch_0cc3:
+0CC3: 32 68 81    ld   (bank_latch_shadow_8168),a
+0CC6: 32 0E D5    ld   (bank_coinlock_d50e),a
 0CC9: C9          ret
-0CCA: 21 6E 81    ld   hl,$816E
-0CCD: 3A 56 81    ld   a,($8156)
+
+;----------------------------------------------------------------------------
+; During the finish-bonus countdown: beep on AY#0 when the score low byte is 0.
+;----------------------------------------------------------------------------
+bonus_count_beep_0cca:
+0CCA: 21 6E 81    ld   hl,p1_score_816e
+0CCD: 3A 56 81    ld   a,(cur_player_8156)
 0CD0: A7          and  a
 0CD1: 20 03       jr   nz,$0CD6
-0CD3: 21 71 81    ld   hl,$8171
+0CD3: 21 71 81    ld   hl,p2_score_8171
 0CD6: 7E          ld   a,(hl)
 0CD7: A7          and  a
-0CD8: CC DC 0C    call z,$0CDC
+0CD8: CC DC 0C    call z,ay0_beep_0cdc
 0CDB: C9          ret
+
+ay0_beep_0cdc:
 0CDC: 21 EC 0C    ld   hl,$0CEC
 0CDF: 06 07       ld   b,$07
 0CE1: 5E          ld   e,(hl)
 0CE2: 23          inc  hl
 0CE3: 56          ld   d,(hl)
 0CE4: 23          inc  hl
-0CE5: ED 53 0E D4 ld   ($D40E),de
+0CE5: ED 53 0E D4 ld   (ay0_addr_d40e),de
 0CE9: 10 F6       djnz $0CE1
 0CEB: C9          ret
-0CEC: 00          nop
-0CED: 60          ld   h,b
-0CEE: 01 00 07    ld   bc,$0700
-0CF1: FE 08       cp   $08
-0CF3: 10 0B       djnz $0D00
-0CF5: 00          nop
-0CF6: 0C          inc  c
-0CF7: 10 0D       djnz $0D06
-0CF9: 00          nop
-0CFA: 0E FF       ld   c,$FF
+
+
+;----------------------------------------------------------------------------
+; MAIN PROGRAM (non-task context). C' = $FF marks 'not a task' for the
+; kernel. Attract mode flags, sound command $8A, spawns task 0 (attract),
+; enables interrupts and idles forever: everything else runs in tasks
+; from the vblank IRQ.
+;----------------------------------------------------------------------------
+main_start_0cfa:
+0CFA: 0E FF       ld   c,$FF                ; C' = $FF : NOT a task
 0CFC: D9          exx
 0CFD: 3E FF       ld   a,$FF
-0CFF: 32 5A 83    ld   ($835A),a
-0D02: 21 7F 7F    ld   hl,$7F7F
-0D05: 22 2B 84    ld   ($842B),hl
+0CFF: 32 5A 83    ld   (scroll_mode_835a),a
+0D02: 21 7F 7F    ld   hl,$7F7F             ; attract mode + title phase
+0D05: 22 2B 84    ld   (attract_mode_842b),hl
 0D08: 3E 8A       ld   a,$8A
-0D0A: 32 0B D5    ld   ($D50B),a
-0D0D: 3E 00       ld   a,$00
-0D0F: CF          rst  $08
-0D10: FB          ei
+0D0A: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $8A
+0D0D: 3E 00       ld   a,$00                ; task 0 = attract
+0D0F: CF          rst  $08                  ; SPAWN task $00 (task00_attract_0d19)
+0D10: FB          ei                        ; interrupts on: the tasks start running
 0D11: 00          nop
 0D12: 00          nop
 0D13: 00          nop
+
+main_idle_loop_0d14:
 0D14: 00          nop
 0D15: 00          nop
 0D16: 00          nop
-0D17: 18 FB       jr   $0D14
+0D17: 18 FB       jr   main_idle_loop_0d14
+
+;----------------------------------------------------------------------------
+; === TASK $00 : ATTRACT MODE ===
+; Spawns task 1 (credit watcher) then loops: title pages drawn with delays
+; (blocks from $7D70..$7EAC), then a demo game: the demo input script at
+; $7ED0 is played into $81D8 (bits 7-5 = stage, 5-0 = controls, next byte
+; = duration) while task 2 plays the game; after each demo stage the
+; 'INSERT COINS' page is shown.
+;----------------------------------------------------------------------------
+task00_attract_0d19:
 0D19: 3E 01       ld   a,$01
-0D1B: F7          rst  $30
-0D1C: CD 8C 0B    call $0B8C
-0D1F: CD B7 0C    call $0CB7
+0D1B: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0D1C: CD 8C 0B    call load_palette_default_0b8c
+0D1F: CD B7 0C    call sound_unmute_0cb7
 0D22: 3E 01       ld   a,$01
-0D24: CF          rst  $08
+0D24: CF          rst  $08                  ; SPAWN task $01 (task01_wait_start_0df1)
+
+attract_loop_0d25:
 0D25: 3E FF       ld   a,$FF
-0D27: 32 5A 83    ld   ($835A),a
-0D2A: 3A 2C 84    ld   a,($842C)
+0D27: 32 5A 83    ld   (scroll_mode_835a),a
+0D2A: 3A 2C 84    ld   a,(attract_phase_842c)
 0D2D: FE 00       cp   $00
-0D2F: CA A2 0D    jp   z,$0DA2
+0D2F: CA A2 0D    jp   z,attract_demo_playback_0da2
 0D32: 21 00 00    ld   hl,$0000
-0D35: 22 35 84    ld   ($8435),hl
+0D35: 22 35 84    ld   (died_flag_8435),hl
 0D38: 21 01 01    ld   hl,$0101
-0D3B: 22 29 84    ld   ($8429),hl
-0D3E: CD B4 04    call $04B4
+0D3B: 22 29 84    ld   (round_8429),hl
+0D3E: CD B4 04    call draw_title_header_04b4
 0D41: 3E 28       ld   a,$28
-0D43: F7          rst  $30
+0D43: F7          rst  $30                  ; SLEEP 40 frames (yield)
 0D44: 21 E3 C4    ld   hl,$C4E3
 0D47: 11 70 7D    ld   de,$7D70
-0D4A: CD E4 02    call $02E4
+0D4A: CD E4 02    call vec_draw_tile_block_02e4
 0D4D: 3E 14       ld   a,$14
-0D4F: F7          rst  $30
+0D4F: F7          rst  $30                  ; SLEEP 20 frames (yield)
 0D50: 21 44 C5    ld   hl,$C544
 0D53: 11 8D 7D    ld   de,$7D8D
-0D56: CD E4 02    call $02E4
+0D56: CD E4 02    call vec_draw_tile_block_02e4
 0D59: 3E 14       ld   a,$14
-0D5B: F7          rst  $30
+0D5B: F7          rst  $30                  ; SLEEP 20 frames (yield)
 0D5C: 21 6E C6    ld   hl,$C66E
 0D5F: 11 67 7E    ld   de,$7E67
-0D62: CD E4 02    call $02E4
+0D62: CD E4 02    call vec_draw_tile_block_02e4
 0D65: 3E 28       ld   a,$28
-0D67: F7          rst  $30
+0D67: F7          rst  $30                  ; SLEEP 40 frames (yield)
 0D68: 21 86 C5    ld   hl,$C586
 0D6B: 11 79 7E    ld   de,$7E79
-0D6E: CD E4 02    call $02E4
+0D6E: CD E4 02    call vec_draw_tile_block_02e4
 0D71: 3E 14       ld   a,$14
-0D73: F7          rst  $30
+0D73: F7          rst  $30                  ; SLEEP 20 frames (yield)
 0D74: 21 8C C5    ld   hl,$C58C
 0D77: 11 8F 7E    ld   de,$7E8F
-0D7A: CD E4 02    call $02E4
+0D7A: CD E4 02    call vec_draw_tile_block_02e4
 0D7D: 3E 14       ld   a,$14
-0D7F: F7          rst  $30
+0D7F: F7          rst  $30                  ; SLEEP 20 frames (yield)
 0D80: 21 90 C5    ld   hl,$C590
 0D83: 11 96 7E    ld   de,$7E96
-0D86: CD E4 02    call $02E4
+0D86: CD E4 02    call vec_draw_tile_block_02e4
 0D89: 3E 14       ld   a,$14
-0D8B: F7          rst  $30
+0D8B: F7          rst  $30                  ; SLEEP 20 frames (yield)
 0D8C: 21 96 C5    ld   hl,$C596
 0D8F: 11 AC 7E    ld   de,$7EAC
-0D92: CD E4 02    call $02E4
+0D92: CD E4 02    call vec_draw_tile_block_02e4
 0D95: 3E 80       ld   a,$80
-0D97: F7          rst  $30
-0D98: 11 D0 7E    ld   de,$7ED0
-0D9B: ED 53 39 84 ld   ($8439),de
+0D97: F7          rst  $30                  ; SLEEP 128 frames (yield)
+0D98: 11 D0 7E    ld   de,$7ED0             ; demo input script
+0D9B: ED 53 39 84 ld   (demo_script_ptr_8439),de
 0D9F: 3E 02       ld   a,$02
-0DA1: CF          rst  $08
-0DA2: ED 5B 39 84 ld   de,($8439)
+0DA1: CF          rst  $08                  ; SPAWN task $02 (task02_game_flow_0e51)
+
+attract_demo_playback_0da2:
+0DA2: ED 5B 39 84 ld   de,(demo_script_ptr_8439)
 0DA6: 1A          ld   a,(de)
 0DA7: 13          inc  de
 0DA8: 47          ld   b,a
@@ -2009,91 +2625,117 @@ music_sequencer_0c00:
 0DAD: 07          rlca
 0DAE: A7          and  a
 0DAF: 28 1A       jr   z,$0DCB
-0DB1: 32 27 84    ld   ($8427),a
+0DB1: 32 27 84    ld   (level_8427),a
 0DB4: 3E FF       ld   a,$FF
-0DB6: 32 D8 81    ld   ($81D8),a
+0DB6: 32 D8 81    ld   (joystick_input_81d8),a  ; demo: 1 frame of "no input"
 0DB9: 3E 01       ld   a,$01
-0DBB: F7          rst  $30
+0DBB: F7          rst  $30                  ; SLEEP 1 frame (yield)
 0DBC: 78          ld   a,b
 0DBD: E6 3F       and  $3F
-0DBF: 32 D8 81    ld   ($81D8),a
+0DBF: 32 D8 81    ld   (joystick_input_81d8),a  ; demo: joystick/button bits
 0DC2: 1A          ld   a,(de)
 0DC3: 13          inc  de
-0DC4: ED 53 39 84 ld   ($8439),de
-0DC8: F7          rst  $30
-0DC9: 18 D7       jr   $0DA2
-0DCB: DF          rst  $18
+0DC4: ED 53 39 84 ld   (demo_script_ptr_8439),de
+0DC8: F7          rst  $30                  ; SLEEP A frames (yield) - hold for (next byte) frames
+0DC9: 18 D7       jr   attract_demo_playback_0da2
+0DCB: DF          rst  $18                  ; KILL ALL OTHER TASKS - end of demo stage: kill the game tasks
 0DCC: 3E 01       ld   a,$01
-0DCE: CF          rst  $08
-0DCF: ED 53 39 84 ld   ($8439),de
+0DCE: CF          rst  $08                  ; SPAWN task $01 (task01_wait_start_0df1)
+0DCF: ED 53 39 84 ld   (demo_script_ptr_8439),de
 0DD3: 3E FF       ld   a,$FF
-0DD5: 32 5A 83    ld   ($835A),a
+0DD5: 32 5A 83    ld   (scroll_mode_835a),a
 0DD8: 78          ld   a,b
 0DD9: A7          and  a
 0DDA: C2 9F 0D    jp   nz,$0D9F
-0DDD: CD 8C 0B    call $0B8C
+0DDD: CD 8C 0B    call load_palette_default_0b8c
 0DE0: 3E 01       ld   a,$01
-0DE2: F7          rst  $30
+0DE2: F7          rst  $30                  ; SLEEP 1 frame (yield)
 0DE3: 3E FF       ld   a,$FF
-0DE5: 32 2C 84    ld   ($842C),a
-0DE8: CD 49 05    call $0549
+0DE5: 32 2C 84    ld   (attract_phase_842c),a
+0DE8: CD 49 05    call draw_insert_coin_screen_0549
 0DEB: 3E 80       ld   a,$80
-0DED: F7          rst  $30
-0DEE: C3 25 0D    jp   $0D25
+0DED: F7          rst  $30                  ; SLEEP 128 frames (yield)
+0DEE: C3 25 0D    jp   attract_loop_0d25
+
+;----------------------------------------------------------------------------
+; === TASK $01 : WAIT FOR CREDIT / START BUTTON ===
+; Waits for credits, kills attract tasks, shows 'PUSH ...', reads START1 /
+; START2, takes the credits, sound $8B, new game init, spawns task 2 and
+; kills itself.
+;----------------------------------------------------------------------------
+task01_wait_start_0df1:
 0DF1: 3E 01       ld   a,$01
-0DF3: F7          rst  $30
-0DF4: 3A 69 81    ld   a,($8169)
+0DF3: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0DF4: 3A 69 81    ld   a,(credits_8169)
 0DF7: A7          and  a
 0DF8: 20 02       jr   nz,$0DFC
-0DFA: 18 F5       jr   $0DF1
-0DFC: DF          rst  $18
-0DFD: CD 8C 0B    call $0B8C
+0DFA: 18 F5       jr   task01_wait_start_0df1
+0DFC: DF          rst  $18                  ; KILL ALL OTHER TASKS
+0DFD: CD 8C 0B    call load_palette_default_0b8c
 0E00: 3E 01       ld   a,$01
-0E02: F7          rst  $30
-0E03: 3A 69 81    ld   a,($8169)
+0E02: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0E03: 3A 69 81    ld   a,(credits_8169)
 0E06: FE 01       cp   $01
 0E08: 20 05       jr   nz,$0E0F
-0E0A: CD E1 05    call $05E1
+0E0A: CD E1 05    call draw_push_1p_button_05e1
 0E0D: 18 03       jr   $0E12
-0E0F: CD FB 05    call $05FB
+0E0F: CD FB 05    call draw_push_1or2p_button_05fb
 0E12: 3E FF       ld   a,$FF
-0E14: 32 5A 83    ld   ($835A),a
-0E17: DF          rst  $18
-0E18: 21 69 81    ld   hl,$8169
-0E1B: 3A 0B D4    ld   a,($D40B)
-0E1E: CB 77       bit  6,a
+0E14: 32 5A 83    ld   (scroll_mode_835a),a
+0E17: DF          rst  $18                  ; KILL ALL OTHER TASKS
+0E18: 21 69 81    ld   hl,credits_8169
+0E1B: 3A 0B D4    ld   a,(in2_coin_start_d40b)  ; IN2
+0E1E: CB 77       bit  6,a                  ; START 1 ?
 0E20: 28 06       jr   z,$0E28
-0E22: CB 7F       bit  7,a
+0E22: CB 7F       bit  7,a                  ; START 2 ?
 0E24: 28 09       jr   z,$0E2F
 0E26: 18 D8       jr   $0E00
 0E28: AF          xor  a
-0E29: 32 6A 81    ld   ($816A),a
+0E29: 32 6A 81    ld   (two_player_game_816a),a
 0E2C: 35          dec  (hl)
 0E2D: 18 0E       jr   $0E3D
 0E2F: 7E          ld   a,(hl)
 0E30: FE 02       cp   $02
 0E32: 30 02       jr   nc,$0E36
-0E34: 18 BB       jr   $0DF1
+0E34: 18 BB       jr   task01_wait_start_0df1
 0E36: 3E 01       ld   a,$01
-0E38: 32 6A 81    ld   ($816A),a
+0E38: 32 6A 81    ld   (two_player_game_816a),a
 0E3B: 35          dec  (hl)
 0E3C: 35          dec  (hl)
 0E3D: 3E 01       ld   a,$01
-0E3F: F7          rst  $30
-0E40: CD 9B 0C    call $0C9B
-0E43: 3E 8B       ld   a,$8B
-0E45: 32 0B D5    ld   ($D50B),a
-0E48: CD 51 0A    call $0A51
-0E4B: 3E 02       ld   a,$02
-0E4D: CF          rst  $08
-0E4E: 3E 01       ld   a,$01
-0E50: D7          rst  $10
+0E3F: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0E40: CD 9B 0C    call enable_coins_0c9b    ; enable coins
+0E43: 3E 8B       ld   a,$8B                ; sound: game start
+0E45: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $8B
+0E48: CD 51 0A    call new_game_init_0a51
+0E4B: 3E 02       ld   a,$02                ; task 2 = game flow
+0E4D: CF          rst  $08                  ; SPAWN task $02 (task02_game_flow_0e51)
+0E4E: 3E 01       ld   a,$01                ; kill myself
+0E50: D7          rst  $10                  ; KILL task $01 (task01_wait_start_0df1)
+
+;----------------------------------------------------------------------------
+; === TASK $02 : GAME FLOW (one iteration per life / stage) ===
+;  - timer period: $3C frames (stage 4: $14)
+;  - stage task ID = table $7F4F[level] (stage inits: $08, $20, $28, $38)
+;  - stage graphics: spawns task 7 with HL = $7F52[level] (gfx ROM source),
+;    BC = $800, waits for event 7 (graphics loaded)
+;  - palette(level, round), spawns the stage task with B = player,
+;    C = round and F.Z = 1 if fresh start (0 = continue from checkpoint)
+;  - spawns task 3 (bonus timer) unless FREE GAME, starts the music
+;  - waits for event 0 (sent by the stage when it ends) then kills all
+;    other tasks and looks at $8434: $FF life lost / $00 stage cleared.
+; Stage cleared: next level (after stage 4: level 1, round+1 (max 4),
+; 'CONGRATULATIONS' + ending task $44, sync on event $69), finish bonus
+; countdown (timer x1/x2/x3), timer reset to 5000.
+; Life lost: lives-1, player switch, or GAME OVER -> back to attract.
+;----------------------------------------------------------------------------
+task02_game_flow_0e51:
 0E51: 3E 01       ld   a,$01
-0E53: F7          rst  $30
-0E54: CD 9C 04    call update_scrolling_049c
-0E57: 21 35 84    ld   hl,$8435
-0E5A: 11 27 84    ld   de,$8427
-0E5D: CD 84 0B    call $0B84
+0E53: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0E54: CD 9C 04    call clear_playfield_049c
+0E57: 21 35 84    ld   hl,died_flag_8435
+0E5A: 11 27 84    ld   de,level_8427
+0E5D: CD 84 0B    call select_player_ptr_0b84
 0E60: E5          push hl
 0E61: 1A          ld   a,(de)
 0E62: FE 04       cp   $04
@@ -2101,66 +2743,66 @@ music_sequencer_0c00:
 0E66: 3E 3C       ld   a,$3C
 0E68: 18 02       jr   $0E6C
 0E6A: 3E 14       ld   a,$14
-0E6C: 32 2D 84    ld   ($842D),a
+0E6C: 32 2D 84    ld   (timer_period_842d),a
 0E6F: 1A          ld   a,(de)
 0E70: 4F          ld   c,a
 0E71: 06 00       ld   b,$00
-0E73: 21 4F 7F    ld   hl,$7F4F
+0E73: 21 4F 7F    ld   hl,$7F4F             ; stage task ID table [level]
 0E76: 09          add  hl,bc
 0E77: EB          ex   de,hl
-0E78: 21 52 7F    ld   hl,$7F52
+0E78: 21 52 7F    ld   hl,$7F52             ; stage graphics source table [level]
 0E7B: CB 01       rlc  c
 0E7D: 09          add  hl,bc
 0E7E: C1          pop  bc
-0E7F: 0A          ld   a,(bc)
+0E7F: 0A          ld   a,(bc)               ; Z = fresh start (not continuing after a death)
 0E80: A7          and  a
 0E81: 1A          ld   a,(de)
 0E82: F5          push af
-0E83: DD E1       pop  ix
+0E83: DD E1       pop  ix                   ; IX = AF (A = stage task ID, F.Z)
 0E85: 5E          ld   e,(hl)
 0E86: 23          inc  hl
 0E87: 56          ld   d,(hl)
 0E88: EB          ex   de,hl
-0E89: 01 00 08    ld   bc,$0800
+0E89: 01 00 08    ld   bc,$0800             ; BC = $800 bytes per bank
 0E8C: 3E 07       ld   a,$07
-0E8E: CF          rst  $08
+0E8E: CF          rst  $08                  ; SPAWN task $07 (task07_load_stage_gfx_10c0) - task 7 loads the graphics (inherits HL, BC)
 0E8F: 3E 07       ld   a,$07
-0E91: E7          rst  $20
+0E91: E7          rst  $20                  ; WAIT for event $07 (yield) - wait until the graphics are loaded
 0E92: 3E 01       ld   a,$01
-0E94: F7          rst  $30
+0E94: F7          rst  $30                  ; SLEEP 1 frame (yield)
 0E95: DD E5       push ix
-0E97: CD 0F 0A    call $0A0F
-0E9A: 21 27 84    ld   hl,$8427
-0E9D: 3A 56 81    ld   a,($8156)
+0E97: CD 0F 0A    call init_playfield_0a0f
+0E9A: 21 27 84    ld   hl,level_8427
+0E9D: 3A 56 81    ld   a,(cur_player_8156)
 0EA0: A7          and  a
 0EA1: 28 05       jr   z,$0EA8
-0EA3: 3A 29 84    ld   a,($8429)
+0EA3: 3A 29 84    ld   a,(round_8429)
 0EA6: 18 04       jr   $0EAC
 0EA8: 23          inc  hl
 0EA9: 3A 2A 84    ld   a,($842A)
 0EAC: 46          ld   b,(hl)
 0EAD: 4F          ld   c,a
-0EAE: CD 8F 0B    call $0B8F
+0EAE: CD 8F 0B    call load_palette_0b8f    ; palette for (level, round)
 0EB1: 00          nop
 0EB2: 00          nop
 0EB3: 00          nop
-0EB4: 3A 56 81    ld   a,($8156)
+0EB4: 3A 56 81    ld   a,(cur_player_8156)  ; B = player
 0EB7: 47          ld   b,a
-0EB8: F1          pop  af
-0EB9: CF          rst  $08
-0EBA: 3A 2B 84    ld   a,($842B)
+0EB8: F1          pop  af                   ; A = stage task ID, F.Z = fresh start
+0EB9: CF          rst  $08                  ; SPAWN task A - spawn the stage task (inherits B=player, C=round, F)
+0EBA: 3A 2B 84    ld   a,(attract_mode_842b)
 0EBD: A7          and  a
-0EBE: 20 38       jr   nz,$0EF8
-0EC0: 3A 5C 81    ld   a,($815C)
+0EBE: 20 38       jr   nz,game_flow_wait_end_0ef8
+0EC0: 3A 5C 81    ld   a,(dsw_lives_limited_815c)
 0EC3: A7          and  a
 0EC4: 28 03       jr   z,$0EC9
 0EC6: 3E 03       ld   a,$03
-0EC8: CF          rst  $08
-0EC9: CD 6A 06    call $066A
-0ECC: CD B7 0C    call $0CB7
-0ECF: 21 27 84    ld   hl,$8427
-0ED2: 11 35 84    ld   de,$8435
-0ED5: CD 84 0B    call $0B84
+0EC8: CF          rst  $08                  ; SPAWN task $03 (task03_bonus_timer_105c) - task 3 = bonus timer (not in FREE GAME)
+0EC9: CD 6A 06    call draw_lives_066a
+0ECC: CD B7 0C    call sound_unmute_0cb7
+0ECF: 21 27 84    ld   hl,level_8427
+0ED2: 11 35 84    ld   de,died_flag_8435
+0ED5: CD 84 0B    call select_player_ptr_0b84
 0ED8: 1A          ld   a,(de)
 0ED9: A7          and  a
 0EDA: 7E          ld   a,(hl)
@@ -2168,50 +2810,52 @@ music_sequencer_0c00:
 0EDD: FE 01       cp   $01
 0EDF: 20 07       jr   nz,$0EE8
 0EE1: 3E 81       ld   a,$81
-0EE3: 32 0B D5    ld   ($D50B),a
-0EE6: 18 10       jr   $0EF8
+0EE3: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $81
+0EE6: 18 10       jr   game_flow_wait_end_0ef8
 0EE8: FE 04       cp   $04
 0EEA: 20 07       jr   nz,$0EF3
 0EEC: 3E B1       ld   a,$B1
-0EEE: 32 0B D5    ld   ($D50B),a
-0EF1: 18 05       jr   $0EF8
+0EEE: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $B1
+0EF1: 18 05       jr   game_flow_wait_end_0ef8
 0EF3: 3E 81       ld   a,$81
-0EF5: 32 3B 84    ld   ($843B),a
-0EF8: 3E 00       ld   a,$00
-0EFA: E7          rst  $20
+0EF5: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $81
+
+game_flow_wait_end_0ef8:
+0EF8: 3E 00       ld   a,$00                ; wait for event 0 = end of the stage (death or clear)
+0EFA: E7          rst  $20                  ; WAIT for event $00 (yield)
 0EFB: 3E 01       ld   a,$01
-0EFD: F7          rst  $30
-0EFE: DF          rst  $18
+0EFD: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0EFE: DF          rst  $18                  ; KILL ALL OTHER TASKS - kill the stage tasks
 0EFF: 00          nop
 0F00: 00          nop
 0F01: 00          nop
-0F02: 3A 2B 84    ld   a,($842B)
+0F02: 3A 2B 84    ld   a,(attract_mode_842b)
 0F05: A7          and  a
 0F06: 28 0A       jr   z,$0F12
 0F08: AF          xor  a
-0F09: 32 2C 84    ld   ($842C),a
+0F09: 32 2C 84    ld   (attract_phase_842c),a
 0F0C: 3E 00       ld   a,$00
-0F0E: CF          rst  $08
-0F0F: C3 51 0E    jp   $0E51
-0F12: 21 25 84    ld   hl,$8425
-0F15: 11 35 84    ld   de,$8435
-0F18: CD 84 0B    call $0B84
-0F1B: 3A 34 84    ld   a,($8434)
+0F0E: CF          rst  $08                  ; SPAWN task $00 (task00_attract_0d19)
+0F0F: C3 51 0E    jp   task02_game_flow_0e51
+0F12: 21 25 84    ld   hl,lives_8425
+0F15: 11 35 84    ld   de,died_flag_8435
+0F18: CD 84 0B    call select_player_ptr_0b84
+0F1B: 3A 34 84    ld   a,(player_died_8434) ; $FF = life lost
 0F1E: A7          and  a
 0F1F: 12          ld   (de),a
-0F20: C2 A7 0F    jp   nz,$0FA7
+0F20: C2 A7 0F    jp   nz,game_flow_life_lost_0fa7
 0F23: E5          push hl
 0F24: D1          pop  de
 0F25: 23          inc  hl
 0F26: 23          inc  hl
-0F27: 34          inc  (hl)
+0F27: 34          inc  (hl)                 ; level + 1
 0F28: 7E          ld   a,(hl)
 0F29: FE 05       cp   $05
-0F2B: DA 51 0E    jp   c,$0E51
+0F2B: DA 51 0E    jp   c,task02_game_flow_0e51
 0F2E: 36 01       ld   (hl),$01
 0F30: 23          inc  hl
 0F31: 23          inc  hl
-0F32: 34          inc  (hl)
+0F32: 34          inc  (hl)                 ; round + 1 (max 4)
 0F33: 7E          ld   a,(hl)
 0F34: FE 05       cp   $05
 0F36: 38 02       jr   c,$0F3A
@@ -2219,20 +2863,20 @@ music_sequencer_0c00:
 0F3A: 21 89 C5    ld   hl,$C589
 0F3D: 11 31 06    ld   de,$0631
 0F40: 0E 08       ld   c,$08
-0F42: CD D5 02    call $02D5
+0F42: CD D5 02    call vec_print_string_slow_02d5  ; 'CONGRATULATIONS'
 0F45: 3E 44       ld   a,$44
-0F47: CF          rst  $08
-0F48: 3A 5C 81    ld   a,($815C)
+0F47: CF          rst  $08                  ; SPAWN task $44 (task44_ending_3b2a) - task $44 = ending
+0F48: 3A 5C 81    ld   a,(dsw_lives_limited_815c)
 0F4B: A7          and  a
 0F4C: 28 06       jr   z,$0F54
-0F4E: 3A 5A 81    ld   a,($815A)
+0F4E: 3A 5A 81    ld   a,(dsw_finish_bonus_815a)
 0F51: A7          and  a
 0F52: 20 0B       jr   nz,$0F5F
 0F54: 3E 69       ld   a,$69
-0F56: E7          rst  $20
+0F56: E7          rst  $20                  ; WAIT for event $69 (yield) - sync with the ending task
 0F57: 3E 01       ld   a,$01
-0F59: F7          rst  $30
-0F5A: 11 2E 84    ld   de,$842E
+0F59: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0F5A: 11 2E 84    ld   de,bonus_timer_842e
 0F5D: 18 33       jr   $0F92
 0F5F: 21 A5 10    ld   hl,$10A5
 0F62: FE 01       cp   $01
@@ -2246,24 +2890,24 @@ music_sequencer_0c00:
 0F6E: 23          inc  hl
 0F6F: 23          inc  hl
 0F70: 3E 69       ld   a,$69
-0F72: E7          rst  $20
+0F72: E7          rst  $20                  ; WAIT for event $69 (yield)
 0F73: 3E 01       ld   a,$01
-0F75: F7          rst  $30
+0F75: F7          rst  $30                  ; SLEEP 1 frame (yield)
 0F76: 22 47 84    ld   ($8447),hl
 0F79: AF          xor  a
-0F7A: 32 74 81    ld   ($8174),a
-0F7D: 3E 01       ld   a,$01
-0F7F: F7          rst  $30
-0F80: CD CA 0C    call $0CCA
+0F7A: 32 74 81    ld   (pending_score_ticks_8174),a
+0F7D: 3E 01       ld   a,$01                ; finish bonus countdown loop
+0F7F: F7          rst  $30                  ; SLEEP 1 frame (yield)
+0F80: CD CA 0C    call bonus_count_beep_0cca
 0F83: 2A 47 84    ld   hl,($8447)
-0F86: CD 9B 10    call $109B
+0F86: CD 9B 10    call add_score_and_update_109b
 0F89: 21 7C 10    ld   hl,$107C
-0F8C: CD 6D 07    call $076D
+0F8C: CD 6D 07    call sub_bonus_timer_076d
 0F8F: D2 7D 0F    jp   nc,$0F7D
 0F92: 3E 69       ld   a,$69
-0F94: E7          rst  $20
+0F94: E7          rst  $20                  ; WAIT for event $69 (yield)
 0F95: 3E 3C       ld   a,$3C
-0F97: F7          rst  $30
+0F97: F7          rst  $30                  ; SLEEP 60 frames (yield)
 0F98: 21 CB 0A    ld   hl,$0ACB
 0F9B: 7E          ld   a,(hl)
 0F9C: 12          ld   (de),a
@@ -2272,36 +2916,45 @@ music_sequencer_0c00:
 0F9F: 7E          ld   a,(hl)
 0FA0: 12          ld   (de),a
 0FA1: 3E 3C       ld   a,$3C
-0FA3: F7          rst  $30
-0FA4: C3 51 0E    jp   $0E51
-0FA7: 35          dec  (hl)
-0FA8: 28 21       jr   z,$0FCB
+0FA3: F7          rst  $30                  ; SLEEP 60 frames (yield)
+0FA4: C3 51 0E    jp   task02_game_flow_0e51
+
+game_flow_life_lost_0fa7:
+0FA7: 35          dec  (hl)                 ; lives - 1
+0FA8: 28 21       jr   z,game_over_0fcb
+
+game_flow_next_life_0faa:
 0FAA: AF          xor  a
-0FAB: 32 2B 84    ld   ($842B),a
-0FAE: CD 99 06    call $0699
-0FB1: 3A 6A 81    ld   a,($816A)
+0FAB: 32 2B 84    ld   (attract_mode_842b),a
+0FAE: CD 99 06    call draw_bonus_label_0699
+0FB1: 3A 6A 81    ld   a,(two_player_game_816a)
 0FB4: A7          and  a
 0FB5: 28 06       jr   z,$0FBD
-0FB7: CD 4C 08    call $084C
-0FBA: CD 03 05    call $0503
+0FB7: CD 4C 08    call switch_player_084c
+0FBA: CD 03 05    call draw_p2_header_0503
 0FBD: 21 B6 C7    ld   hl,$C7B6
 0FC0: 01 08 00    ld   bc,$0008
 0FC3: 3E FF       ld   a,$FF
-0FC5: CD EB 03    call $03EB
-0FC8: C3 51 0E    jp   $0E51
+0FC5: CD EB 03    call fill_mem_double_03eb
+0FC8: C3 51 0E    jp   task02_game_flow_0e51
+
+;----------------------------------------------------------------------------
+; GAME OVER sequence (also entered by the bonus timer task, see 1075).
+;----------------------------------------------------------------------------
+game_over_0fcb:
 0FCB: 3E 80       ld   a,$80
-0FCD: 32 3B 84    ld   ($843B),a
-0FD0: DF          rst  $18
+0FCD: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
+0FD0: DF          rst  $18                  ; KILL ALL OTHER TASKS - kill all other tasks
 0FD1: 3E 3C       ld   a,$3C
-0FD3: F7          rst  $30
+0FD3: F7          rst  $30                  ; SLEEP 60 frames (yield)
 0FD4: 3E FF       ld   a,$FF
-0FD6: 32 2B 84    ld   ($842B),a
-0FD9: CD E0 04    call $04E0
-0FDC: CD AE 10    call $10AE
-0FDF: 3A 6A 81    ld   a,($816A)
+0FD6: 32 2B 84    ld   (attract_mode_842b),a
+0FD9: CD E0 04    call draw_credit_label_04e0
+0FDC: CD AE 10    call draw_hiscore_header_10ae
+0FDF: 3A 6A 81    ld   a,(two_player_game_816a)
 0FE2: A7          and  a
 0FE3: 28 4D       jr   z,$1032
-0FE5: 3A 56 81    ld   a,($8156)
+0FE5: 3A 56 81    ld   a,(cur_player_8156)
 0FE8: A7          and  a
 0FE9: 20 27       jr   nz,$1012
 0FEB: 21 4C 06    ld   hl,$064C
@@ -2313,136 +2966,170 @@ music_sequencer_0c00:
 0FFB: 21 25 C6    ld   hl,$C625
 0FFE: 11 00 86    ld   de,$8600
 1001: 0E 02       ld   c,$02
-1003: CD D5 02    call $02D5
+1003: CD D5 02    call vec_print_string_slow_02d5
 1006: 3E 3C       ld   a,$3C
-1008: F7          rst  $30
-1009: 3A 25 84    ld   a,($8425)
+1008: F7          rst  $30                  ; SLEEP 60 frames (yield)
+1009: 3A 25 84    ld   a,(lives_8425)
 100C: A7          and  a
-100D: C2 AA 0F    jp   nz,$0FAA
+100D: C2 AA 0F    jp   nz,game_flow_next_life_0faa
 1010: 18 15       jr   $1027
 1012: 21 25 C6    ld   hl,$C625
 1015: 11 4C 06    ld   de,$064C
 1018: 0E 02       ld   c,$02
-101A: CD D5 02    call $02D5
+101A: CD D5 02    call vec_print_string_slow_02d5
 101D: 3E 3C       ld   a,$3C
-101F: F7          rst  $30
+101F: F7          rst  $30                  ; SLEEP 60 frames (yield)
 1020: 3A 26 84    ld   a,($8426)
 1023: A7          and  a
-1024: C2 AA 0F    jp   nz,$0FAA
-1027: CD 8C 0B    call $0B8C
-102A: CD 9C 04    call update_scrolling_049c
+1024: C2 AA 0F    jp   nz,game_flow_next_life_0faa
+1027: CD 8C 0B    call load_palette_default_0b8c
+102A: CD 9C 04    call clear_playfield_049c
 102D: 06 03       ld   b,$03
-102F: CD 74 08    call $0874
+102F: CD 74 08    call set_screen_flip_0874
 1032: 21 8B C5    ld   hl,$C58B
 1035: 11 41 06    ld   de,$0641
 1038: 0E 02       ld   c,$02
-103A: CD D5 02    call $02D5
+103A: CD D5 02    call vec_print_string_slow_02d5
 103D: 3E 7E       ld   a,$7E
-103F: F7          rst  $30
-1040: CD 9C 04    call update_scrolling_049c
+103F: F7          rst  $30                  ; SLEEP 126 frames (yield)
+1040: CD 9C 04    call clear_playfield_049c
 1043: 3E 03       ld   a,$03
-1045: 32 56 81    ld   ($8156),a
-1048: CD 0F 0A    call $0A0F
+1045: 32 56 81    ld   (cur_player_8156),a
+1048: CD 0F 0A    call init_playfield_0a0f
 104B: 21 7F 7F    ld   hl,$7F7F
-104E: 22 2B 84    ld   ($842B),hl
-1051: 3E 01       ld   a,$01
-1053: 32 0C D5    ld   ($D50C),a
+104E: 22 2B 84    ld   (attract_mode_842b),hl
+1051: 3E 01       ld   a,$01                ; sound CPU: no music in attract
+1053: 32 0C D5    ld   (sound_semaphore_d50c),a
 1056: 3E 00       ld   a,$00
-1058: CF          rst  $08
+1058: CF          rst  $08                  ; SPAWN task $00 (task00_attract_0d19) - task 0 = attract
 1059: 3E 02       ld   a,$02
-105B: D7          rst  $10
-105C: 3A 2D 84    ld   a,($842D)
-105F: F7          rst  $30
+105B: D7          rst  $10                  ; KILL task $02 (task02_game_flow_0e51) - kill myself
+
+;----------------------------------------------------------------------------
+; === TASK $03 : BONUS TIMER ===
+; Every $842D frames the bonus timer -= 10. When it runs out the lives of
+; the current player are set to 0 and it jumps into the GAME OVER code of
+; task 2 after setting C' = 2: the timer task IMPERSONATES task 2 (the
+; kernel only knows the running task by C'), so RST 18 then keeps task 2's
+; slot. Tricky for a port!
+;----------------------------------------------------------------------------
+task03_bonus_timer_105c:
+105C: 3A 2D 84    ld   a,(timer_period_842d)
+105F: F7          rst  $30                  ; SLEEP A frames (yield)
 1060: 21 7C 10    ld   hl,$107C
-1063: CD 6D 07    call $076D
+1063: CD 6D 07    call sub_bonus_timer_076d ; timer - 10
 1066: DA 6B 10    jp   c,$106B
-1069: 18 F1       jr   $105C
-106B: CD 81 0B    call $0B81
-106E: 36 00       ld   (hl),$00
+1069: 18 F1       jr   task03_bonus_timer_105c
+106B: CD 81 0B    call get_lives_ptr_0b81
+106E: 36 00       ld   (hl),$00             ; lives = 0
 1070: 3E FF       ld   a,$FF
-1072: 32 5A 83    ld   ($835A),a
-1075: D9          exx
+1072: 32 5A 83    ld   (scroll_mode_835a),a
+1075: D9          exx                       ; C' = 2 : from now on this task pretends to be task 2 !
 1076: 0E 02       ld   c,$02
 1078: D9          exx
-1079: C3 CB 0F    jp   $0FCB
-107C: 10 00       djnz $107E
-107E: 00          nop
-107F: 20 00       jr   nz,$1081
-1081: 00          nop
-1082: 30 00       jr   nc,$1084
-1084: 00          nop
-1085: FF          rst  $38
-1086: 8A          adc  a,d
-1087: 8B          adc  a,e
-1088: 8C          adc  a,h
-1089: 8D          adc  a,l
-108A: 8E          adc  a,(hl)
-108B: FF          rst  $38
-108C: FF          rst  $38
-108D: 21 74 81    ld   hl,$8174
+1079: C3 CB 0F    jp   game_over_0fcb
+
+;----------------------------------------------------------------------------
+; DATA: BCD 000010 (timer step)  then 'BONUS' label tiles at 1085
+;----------------------------------------------------------------------------
+table_bcd_10_107c:
+
+
+;----------------------------------------------------------------------------
+; === TASK $06 (also called by the IRQ every frame) : award one pending +10 points tick ($8174) ===
+;----------------------------------------------------------------------------
+task06_award_pending_score_108d:
+108D: 21 74 81    ld   hl,pending_score_ticks_8174
 1090: 7E          ld   a,(hl)
 1091: A7          and  a
 1092: C8          ret  z
 1093: 35          dec  (hl)
 1094: 21 A5 10    ld   hl,$10A5
-1097: CD 9B 10    call $109B
+1097: CD 9B 10    call add_score_and_update_109b
 109A: C9          ret
-109B: CD 43 07    call $0743
-109E: CD 2D 04    call $042D
-10A1: CD DA 06    call $06DA
+
+;----------------------------------------------------------------------------
+; Add (HL) to the score, redraw it, check extra life.
+;----------------------------------------------------------------------------
+add_score_and_update_109b:
+109B: CD 43 07    call add_score_0743
+109E: CD 2D 04    call draw_current_score_042d
+10A1: CD DA 06    call check_extra_life_06da
 10A4: C9          ret
-10A5: 10 00       djnz $10A7
-10A7: 00          nop
-10A8: 20 00       jr   nz,$10AA
-10AA: 00          nop
-10AB: 30 00       jr   nc,$10AD
-10AD: 00          nop
+
+;----------------------------------------------------------------------------
+; DATA: finish bonus steps 000010 / 000020 / 000030 (BCD)
+;----------------------------------------------------------------------------
+table_bcd_10_10a5:
+
+
+;----------------------------------------------------------------------------
+; Draw ' HI-SCORE ' header, update and draw the high score.
+;----------------------------------------------------------------------------
+draw_hiscore_header_10ae:
 10AE: 21 1F 05    ld   hl,$051F
 10B1: 11 4B C4    ld   de,$C44B
 10B4: 01 0A 00    ld   bc,$000A
 10B7: ED B0       ldir
-10B9: CD B2 06    call $06B2
-10BC: CD 25 04    call $0425
+10B9: CD B2 06    call update_hiscore_06b2
+10BC: CD 25 04    call draw_hiscore_0425
 10BF: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $07 : LOAD STAGE GRAPHICS ===  (parameters inherited from the
+; parent: HL = graphics ROM source, BC = bytes per bank)
+; Copies 3 banks to char RAM $9000 / $9800 / $A000 (one bank per frame),
+; then signals event 7 and kills itself.
+;----------------------------------------------------------------------------
+task07_load_stage_gfx_10c0:
 10C0: 3E 01       ld   a,$01
-10C2: F7          rst  $30
+10C2: F7          rst  $30                  ; SLEEP 1 frame (yield)
 10C3: ED 43 47 84 ld   ($8447),bc
 10C7: 22 49 84    ld   ($8449),hl
 10CA: 11 00 90    ld   de,$9000
-10CD: CD 03 11    call $1103
+10CD: CD 03 11    call gfxrom_copy_chunk_1103
 10D0: 21 E0 97    ld   hl,$97E0
 10D3: 01 20 00    ld   bc,$0020
-10D6: CD EA 03    call $03EA
+10D6: CD EA 03    call clear_mem_double_03ea
 10D9: 3E 01       ld   a,$01
-10DB: F7          rst  $30
+10DB: F7          rst  $30                  ; SLEEP 1 frame (yield)
 10DC: 11 00 98    ld   de,$9800
-10DF: CD 03 11    call $1103
+10DF: CD 03 11    call gfxrom_copy_chunk_1103
 10E2: 21 E0 9F    ld   hl,$9FE0
 10E5: 01 20 00    ld   bc,$0020
-10E8: CD EA 03    call $03EA
+10E8: CD EA 03    call clear_mem_double_03ea
 10EB: 3E 01       ld   a,$01
-10ED: F7          rst  $30
+10ED: F7          rst  $30                  ; SLEEP 1 frame (yield)
 10EE: 11 00 A0    ld   de,$A000
-10F1: CD 03 11    call $1103
+10F1: CD 03 11    call gfxrom_copy_chunk_1103
 10F4: 21 E0 A7    ld   hl,$A7E0
 10F7: 01 20 00    ld   bc,$0020
-10FA: CD EA 03    call $03EA
-10FD: 3E 07       ld   a,$07
-10FF: EF          rst  $28
-1100: 3E 07       ld   a,$07
-1102: D7          rst  $10
+10FA: CD EA 03    call clear_mem_double_03ea
+10FD: 3E 07       ld   a,$07                ; signal: graphics loaded
+10FF: EF          rst  $28                  ; SIGNAL event $07
+1100: 3E 07       ld   a,$07                ; kill myself
+1102: D7          rst  $10                  ; KILL task $07 (task07_load_stage_gfx_10c0)
+
+gfxrom_copy_chunk_1103:
 1103: ED 4B 47 84 ld   bc,($8447)
 1107: 2A 49 84    ld   hl,($8449)
-110A: CD 9A 07    call $079A
+110A: CD 9A 07    call copy_gfxrom_to_charram_079a
 110D: 22 49 84    ld   ($8449),hl
 1110: C9          ret
+
+;----------------------------------------------------------------------------
+; Draw the pending tile column of layer 2 ($8305 -> $C800 + column $8354)
+; and layer 3 ($8325 -> $CC00 + column $8355): 28 tiles + 4 attribute bytes
+; ($81F9 / $8279 tables). Advances the 0..3 frame phase $8347.
+;----------------------------------------------------------------------------
+draw_new_bg_columns_1111:
 1111: 0E 02       ld   c,$02
-1113: 11 05 83    ld   de,$8305
-1116: 21 F9 81    ld   hl,$81F9
+1113: 11 05 83    ld   de,column_buffer_8305
+1116: 21 F9 81    ld   hl,bg_attr_l2_81f9
 1119: D9          exx
 111A: 11 20 00    ld   de,$0020
 111D: 26 C8       ld   h,$C8
-111F: 3A 54 83    ld   a,($8354)
+111F: 3A 54 83    ld   a,(bg_column_l2_8354)
 1122: 6F          ld   l,a
 1123: D9          exx
 1124: 85          add  a,l
@@ -2470,7 +3157,7 @@ music_sequencer_0c00:
 1140: 10 F4       djnz $1136
 1142: 0D          dec  c
 1143: 20 0C       jr   nz,$1151
-1145: 21 47 83    ld   hl,$8347
+1145: 21 47 83    ld   hl,scroll_phase_8347
 1148: 7E          ld   a,(hl)
 1149: 3C          inc  a
 114A: FE 04       cp   $04
@@ -2478,13 +3165,20 @@ music_sequencer_0c00:
 114E: AF          xor  a
 114F: 77          ld   (hl),a
 1150: C9          ret
-1151: 21 79 82    ld   hl,$8279
+1151: 21 79 82    ld   hl,bg_attr_l3_8279
 1154: D9          exx
 1155: 26 CC       ld   h,$CC
-1157: 3A 55 83    ld   a,($8355)
+1157: 3A 55 83    ld   a,(bg_column_l3_8355)
 115A: 18 C6       jr   $1122
+
+;----------------------------------------------------------------------------
+; Scroll speed lookup: A = signed speed (-15..15) -> pixels to move this
+; frame, from the table at $130A indexed by |A|*4 + frame phase $8347
+; (gives fractional speeds). Preserves BC/DE/HL (EXX).
+;----------------------------------------------------------------------------
+scroll_speed_lookup_115c:
 115C: D9          exx
-115D: 21 47 83    ld   hl,$8347
+115D: 21 47 83    ld   hl,scroll_phase_8347
 1160: 47          ld   b,a
 1161: 11 0A 13    ld   de,$130A
 1164: CB 7F       bit  7,a
@@ -2503,13 +3197,20 @@ music_sequencer_0c00:
 1178: ED 44       neg
 117A: D9          exx
 117B: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $04 : BACKGROUND SCROLL ===
+; Every frame: speed ($8345) -> per-frame delta ($8348/$8349), scroll the
+; map of layers 2 and 3 (11A1) and compute the hardware scroll regs.
+;----------------------------------------------------------------------------
+task04_scroll_117c:
 117C: 3E 01       ld   a,$01
-117E: F7          rst  $30
-117F: 21 45 83    ld   hl,$8345
-1182: 11 48 83    ld   de,$8348
+117E: F7          rst  $30                  ; SLEEP 1 frame (yield)
+117F: 21 45 83    ld   hl,scroll_speed_8345
+1182: 11 48 83    ld   de,layer_scroll_state_8348
 1185: 7E          ld   a,(hl)
 1186: 23          inc  hl
-1187: CD DE 02    call $02DE
+1187: CD DE 02    call vec_scroll_speed_lookup_02de
 118A: 12          ld   (de),a
 118B: 13          inc  de
 118C: 47          ld   b,a
@@ -2521,13 +3222,21 @@ music_sequencer_0c00:
 1195: 77          ld   (hl),a
 1196: 78          ld   a,b
 1197: 12          ld   (de),a
-1198: CD A1 11    call $11A1
-119B: CD 9F 12    call $129F
-119E: C3 7C 11    jp   $117C
-11A1: 21 05 83    ld   hl,$8305
+1198: CD A1 11    call scroll_layers_step_11a1
+119B: CD 9F 12    call compute_scroll_regs_129f
+119E: C3 7C 11    jp   task04_scroll_117c
+
+;----------------------------------------------------------------------------
+; Advance layers 2 and 3 by their speed. When an 8-pixel boundary is
+; crossed, the next map column is built in $8305 (layout depends on the
+; stage mode $835A) from the map stream (run-length list of column
+; pointers) and will be drawn by the IRQ (1111).
+;----------------------------------------------------------------------------
+scroll_layers_step_11a1:
+11A1: 21 05 83    ld   hl,column_buffer_8305
 11A4: 0E 02       ld   c,$02
-11A6: FD 21 FB 82 ld   iy,$82FB
-11AA: DD 21 48 83 ld   ix,$8348
+11A6: FD 21 FB 82 ld   iy,scroll_l2_x_82fb
+11AA: DD 21 48 83 ld   ix,layer_scroll_state_8348
 11AE: DD 7E 00    ld   a,(ix+$00)
 11B1: ED 44       neg
 11B3: FD 56 00    ld   d,(iy+$00)
@@ -2539,7 +3248,7 @@ music_sequencer_0c00:
 11BE: E6 F8       and  $F8
 11C0: BB          cp   e
 11C1: CA 31 12    jp   z,$1231
-11C4: 3A 5A 83    ld   a,($835A)
+11C4: 3A 5A 83    ld   a,(scroll_mode_835a)
 11C7: E6 7F       and  $7F
 11C9: CA 37 12    jp   z,$1237
 11CC: E6 02       and  $02
@@ -2661,8 +3370,13 @@ music_sequencer_0c00:
 129A: 0D          dec  c
 129B: C2 AE 11    jp   nz,$11AE
 129E: C9          ret
-129F: DD 21 F9 82 ld   ix,$82F9
-12A3: 3A 57 81    ld   a,($8157)
+
+;----------------------------------------------------------------------------
+; Logical scroll $82F9-$82FE -> hardware values $82FF-$8304 (per-layer fine x offset tables $12DA/$12F2 depending on flip, y+$F0).
+;----------------------------------------------------------------------------
+compute_scroll_regs_129f:
+129F: DD 21 F9 82 ld   ix,scroll_logical_82f9
+12A3: 3A 57 81    ld   a,(flip_bits_8157)
 12A6: A7          and  a
 12A7: 28 05       jr   z,$12AE
 12A9: 11 DA 12    ld   de,$12DA
@@ -2692,15 +3406,21 @@ music_sequencer_0c00:
 12D7: 10 DA       djnz $12B3
 12D9: C9          ret
 
+;----------------------------------------------------------------------------
+; Init the scrolling map of layers 2/3. in: HL / DE = map stream headers,
+; BC = start distance (pre-scrolls BC steps, e.g. restart from checkpoint),
+; then draws 32 full columns and enables column drawing.
+;----------------------------------------------------------------------------
+init_scrolling_map_134a:
 134A: C5          push bc
-134B: DD 21 48 83 ld   ix,$8348
+134B: DD 21 48 83 ld   ix,layer_scroll_state_8348
 134F: 3E 08       ld   a,$08
 1351: DD 77 00    ld   (ix+$00),a
 1354: 3D          dec  a
 1355: DD 77 01    ld   (ix+$01),a
-1358: 3A 5A 83    ld   a,($835A)
+1358: 3A 5A 83    ld   a,(scroll_mode_835a)
 135B: F6 80       or   $80
-135D: 32 5A 83    ld   ($835A),a
+135D: 32 5A 83    ld   (scroll_mode_835a),a
 1360: 06 02       ld   b,$02
 1362: 7E          ld   a,(hl)
 1363: DD 77 0A    ld   (ix+$0a),a
@@ -2717,46 +3437,51 @@ music_sequencer_0c00:
 1378: DD 23       inc  ix
 137A: 10 E6       djnz $1362
 137C: AF          xor  a
-137D: 32 45 83    ld   ($8345),a
-1380: 32 46 83    ld   ($8346),a
-1383: 21 FB 82    ld   hl,$82FB
+137D: 32 45 83    ld   (scroll_speed_8345),a
+1380: 32 46 83    ld   (scroll_frac_8346),a
+1383: 21 FB 82    ld   hl,scroll_l2_x_82fb
 1386: 06 04       ld   b,$04
 1388: 77          ld   (hl),a
 1389: 23          inc  hl
 138A: 10 FC       djnz $1388
 138C: 21 00 00    ld   hl,$0000
-138F: 22 56 83    ld   ($8356),hl
-1392: 22 58 83    ld   ($8358),hl
+138F: 22 56 83    ld   (distance_hi_8356),hl
+1392: 22 58 83    ld   (distance_lo_8358),hl
 1395: C1          pop  bc
 1396: 18 06       jr   $139E
 1398: C5          push bc
-1399: CD A1 11    call $11A1
+1399: CD A1 11    call scroll_layers_step_11a1
 139C: C1          pop  bc
 139D: 0B          dec  bc
 139E: 78          ld   a,b
 139F: B1          or   c
 13A0: 20 F6       jr   nz,$1398
-13A2: 2A 56 83    ld   hl,($8356)
+13A2: 2A 56 83    ld   hl,(distance_hi_8356)
 13A5: E5          push hl
-13A6: 2A 58 83    ld   hl,($8358)
+13A6: 2A 58 83    ld   hl,(distance_lo_8358)
 13A9: E5          push hl
 13AA: 3E 08       ld   a,$08
 13AC: 32 49 83    ld   ($8349),a
 13AF: 06 20       ld   b,$20
 13B1: C5          push bc
-13B2: CD A1 11    call $11A1
-13B5: CD 11 11    call $1111
+13B2: CD A1 11    call scroll_layers_step_11a1
+13B5: CD 11 11    call draw_new_bg_columns_1111
 13B8: C1          pop  bc
 13B9: 10 F6       djnz $13B1
 13BB: E1          pop  hl
-13BC: 22 58 83    ld   ($8358),hl
+13BC: 22 58 83    ld   (distance_lo_8358),hl
 13BF: E1          pop  hl
-13C0: 22 56 83    ld   ($8356),hl
-13C3: CD 9F 12    call $129F
-13C6: 3A 5A 83    ld   a,($835A)
+13C0: 22 56 83    ld   (distance_hi_8356),hl
+13C3: CD 9F 12    call compute_scroll_regs_129f
+13C6: 3A 5A 83    ld   a,(scroll_mode_835a)
 13C9: E6 7F       and  $7F
-13CB: 32 5A 83    ld   ($835A),a
+13CB: 32 5A 83    ld   (scroll_mode_835a),a
 13CE: 06 2D       ld   b,$2D
+
+;----------------------------------------------------------------------------
+; Fill column 0 and column 31 of layer 1 with tile B (masks the scrolling edges).
+;----------------------------------------------------------------------------
+draw_border_columns_13d0:
 13D0: 21 00 C4    ld   hl,$C400
 13D3: 11 1F 00    ld   de,$001F
 13D6: 78          ld   a,b
@@ -2769,11 +3494,19 @@ music_sequencer_0c00:
 13DE: 23          inc  hl
 13DF: 10 F8       djnz $13D9
 13E1: C9          ret
-13E2: 21 5B 83    ld   hl,$835B
-13E5: 11 BB 83    ld   de,$83BB
+
+;----------------------------------------------------------------------------
+; === TASK $05 : SPRITE POSITIONS ===
+; Every frame converts the 24 logical positions $835B (9-bit x/y) into
+; hardware X/Y in the sprite shadow $83BB (off-screen -> Y=$E8), with the
+; flip dependent offset.
+;----------------------------------------------------------------------------
+task05_sprite_positions_13e2:
+13E2: 21 5B 83    ld   hl,object_pos_835b
+13E5: 11 BB 83    ld   de,sprite_shadow_83bb
 13E8: 06 18       ld   b,$18
 13EA: D9          exx
-13EB: 3A 57 81    ld   a,($8157)
+13EB: 3A 57 81    ld   a,(flip_bits_8157)
 13EE: A7          and  a
 13EF: 28 05       jr   z,$13F6
 13F1: 11 0F FF    ld   de,$FF0F
@@ -2818,45 +3551,86 @@ music_sequencer_0c00:
 142B: 23          inc  hl
 142C: 10 CC       djnz $13FA
 142E: 3E 01       ld   a,$01
-1430: F7          rst  $30
-1431: C3 E2 13    jp   $13E2
+1430: F7          rst  $30                  ; SLEEP 1 frame (yield)
+1431: C3 E2 13    jp   task05_sprite_positions_13e2
 1434: 13          inc  de
 1435: 23          inc  hl
 1436: 23          inc  hl
 1437: 3E E8       ld   a,$E8
 1439: 18 E9       jr   $1424
 
-14C0: C3 ED 14    jp   $14ED
-14C3: C3 0C 17    jp   $170C
-14C6: C3 51 17    jp   $1751
-14C9: C3 9A 17    jp   $179A
-14CC: C3 E2 17    jp   $17E2
-14CF: C3 CF 18    jp   $18CF
-14D2: C3 90 1A    jp   $1A90
-14D5: C3 BF 1A    jp   $1ABF
-14D8: C3 20 1B    jp   $1B20
-14DB: C3 8C 1B    jp   $1B8C
-14DE: C3 17 1C    jp   $1C17
-14E1: C3 38 1C    jp   $1C38
-14E4: C3 4B 1D    jp   $1D4B
-14E7: C3 87 1D    jp   $1D87
-14EA: C3 00 1F    jp   $1F00
+;----------------------------------------------------------------------------
+; Task entry vectors of stage 1: task IDs $08..$16 (in this order).
+;----------------------------------------------------------------------------
+vec_task08_14c0:
+14C0: C3 ED 14    jp   task08_s1_init_14ed
+
+vec_task09_14c3:
+14C3: C3 0C 17    jp   task09_s1_scroll_follow_170c
+
+vec_task0a_14c6:
+14C6: C3 51 17    jp   task0a_s1_vine1_anim_1751
+
+vec_task0b_14c9:
+14C9: C3 9A 17    jp   task0b_s1_vine2_anim_179a
+
+vec_task0c_14cc:
+14CC: C3 E2 17    jp   task0c_s1_vine3_anim_17e2
+
+vec_task0d_14cf:
+14CF: C3 CF 18    jp   task0d_s1_vine_grab_18cf
+
+vec_task0e_14d2:
+14D2: C3 90 1A    jp   task0e_s1_fall_check_1a90
+
+vec_task0f_14d5:
+14D5: C3 BF 1A    jp   task0f_s1_stage_clear_1abf
+
+vec_task10_14d8:
+14D8: C3 20 1B    jp   task10_s1_jump_button_1b20
+
+vec_task11_14db:
+14DB: C3 8C 1B    jp   task11_s1_player_path_1b8c
+
+vec_task12_14de:
+14DE: C3 17 1C    jp   task12_s1_end_zone_check_1c17
+
+vec_task13_14e1:
+14E1: C3 38 1C    jp   task13_s1_monkey_1c38
+
+vec_task14_14e4:
+14E4: C3 4B 1D    jp   task14_s1_life_lost_1d4b
+
+vec_task15_14e7:
+14E7: C3 87 1D    jp   task15_s1_landing_1d87
+
+vec_task16_14ea:
+14EA: C3 00 1F    jp   task16_s1_hold_timeout_1f00
+
+;----------------------------------------------------------------------------
+; === TASK $08 : STAGE 1 (VINES) INIT ===  in: C = round, F.Z = fresh start
+; Clears stage variables $8498-$84D7 and the objects, 3 vines x 6 segments,
+; difficulty parameters $4A00+16*(round-1) -> $84C6, map $40B0/$40F0,
+; start position (checkpoint if not fresh), then spawns the stage tasks
+; $04,$05,$09-$0E,$12,$15,$16 and $10, and kills itself.
+;----------------------------------------------------------------------------
+task08_s1_init_14ed:
 14ED: 3E 01       ld   a,$01
-14EF: F7          rst  $30
+14EF: F7          rst  $30                  ; SLEEP 1 frame (yield)
 14F0: 08          ex   af,af'
-14F1: 3E 80       ld   a,$80
-14F3: 32 3B 84    ld   ($843B),a
+14F1: 3E 80       ld   a,$80                ; stop AY#0 effect
+14F3: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 14F6: 06 00       ld   b,$00
-14F8: CD D8 02    call $02D8
+14F8: CD D8 02    call vec_set_video_enable_02d8
 14FB: 3E 08       ld   a,$08
-14FD: 32 00 D3    ld   ($D300),a
+14FD: 32 00 D3    ld   (priority_d300),a
 1500: AF          xor  a
 1501: 21 98 84    ld   hl,$8498
 1504: 06 40       ld   b,$40
 1506: 77          ld   (hl),a
 1507: 23          inc  hl
 1508: 10 FC       djnz $1506
-150A: 21 5B 83    ld   hl,$835B
+150A: 21 5B 83    ld   hl,object_pos_835b
 150D: 06 C0       ld   b,$C0
 150F: 77          ld   (hl),a
 1510: 23          inc  hl
@@ -2877,7 +3651,7 @@ music_sequencer_0c00:
 1530: 32 AA 84    ld   ($84AA),a
 1533: 32 AB 84    ld   ($84AB),a
 1536: 32 AC 84    ld   ($84AC),a
-1539: 3A D8 81    ld   a,($81D8)
+1539: 3A D8 81    ld   a,(joystick_input_81d8)
 153C: 32 A8 84    ld   ($84A8),a
 153F: 21 00 46    ld   hl,$4600
 1542: 22 B8 84    ld   ($84B8),hl
@@ -2886,7 +3660,7 @@ music_sequencer_0c00:
 154B: 22 BA 84    ld   ($84BA),hl
 154E: 22 BE 84    ld   ($84BE),hl
 1551: 22 C2 84    ld   ($84C2),hl
-1554: 79          ld   a,c
+1554: 79          ld   a,c                  ; C = round (inherited)
 1555: FE 01       cp   $01
 1557: 20 05       jr   nz,$155E
 1559: 21 00 4A    ld   hl,$4A00
@@ -2904,15 +3678,15 @@ music_sequencer_0c00:
 1576: 01 10 00    ld   bc,$0010
 1579: ED B0       ldir
 157B: 3E 02       ld   a,$02
-157D: 32 5A 83    ld   ($835A),a
-1580: 08          ex   af,af'
+157D: 32 5A 83    ld   (scroll_mode_835a),a
+1580: 08          ex   af,af'               ; F.Z inherited from task 2 (fresh start)
 1581: 28 59       jr   z,$15DC
 1583: 08          ex   af,af'
-1584: 3A 2B 84    ld   a,($842B)
+1584: 3A 2B 84    ld   a,(attract_mode_842b)
 1587: B7          or   a
 1588: 20 05       jr   nz,$158F
 158A: 3E 81       ld   a,$81
-158C: 32 3B 84    ld   ($843B),a
+158C: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $81
 158F: 3E 32       ld   a,$32
 1591: 32 98 84    ld   ($8498),a
 1594: 3E 01       ld   a,$01
@@ -2932,7 +3706,7 @@ music_sequencer_0c00:
 15B7: 32 BE 83    ld   ($83BE),a
 15BA: 3C          inc  a
 15BB: 32 C2 83    ld   ($83C2),a
-15BE: 3A 56 81    ld   a,($8156)
+15BE: 3A 56 81    ld   a,(cur_player_8156)  ; continue: restart at the checkpoint
 15C1: B7          or   a
 15C2: 28 0C       jr   z,$15D0
 15C4: 3A D9 81    ld   a,($81D9)
@@ -2963,22 +3737,22 @@ music_sequencer_0c00:
 15FB: C5          push bc
 15FC: 21 B0 40    ld   hl,$40B0
 15FF: 11 F0 40    ld   de,$40F0
-1602: CD DB 02    call $02DB
+1602: CD DB 02    call vec_init_scrolling_map_02db  ; init_scrolling_map
 1605: C1          pop  bc
 1606: 78          ld   a,b
-1607: 32 56 83    ld   ($8356),a
+1607: 32 56 83    ld   (distance_hi_8356),a
 160A: 79          ld   a,c
-160B: 32 58 83    ld   ($8358),a
+160B: 32 58 83    ld   (distance_lo_8358),a
 160E: 08          ex   af,af'
 160F: 20 12       jr   nz,$1623
 1611: 21 5A CC    ld   hl,$CC5A
 1614: 11 00 40    ld   de,$4000
-1617: CD E4 02    call $02E4
+1617: CD E4 02    call vec_draw_tile_block_02e4
 161A: 21 B4 CD    ld   hl,$CDB4
 161D: 11 92 40    ld   de,$4092
-1620: CD E4 02    call $02E4
+1620: CD E4 02    call vec_draw_tile_block_02e4
 1623: 06 70       ld   b,$70
-1625: CD D8 02    call $02D8
+1625: CD D8 02    call vec_set_video_enable_02d8
 1628: 11 04 00    ld   de,$0004
 162B: 21 74 83    ld   hl,$8374
 162E: 01 48 06    ld   bc,$0648
@@ -3050,67 +3824,74 @@ music_sequencer_0c00:
 16B6: 71          ld   (hl),c
 16B7: 19          add  hl,de
 16B8: 10 FC       djnz $16B6
-16BA: 3E 05       ld   a,$05
-16BC: CF          rst  $08
+16BA: 3E 05       ld   a,$05                ; one-shot sprite update
+16BC: CF          rst  $08                  ; SPAWN task $05 (task05_sprite_positions_13e2)
 16BD: 3E 05       ld   a,$05
-16BF: D7          rst  $10
+16BF: D7          rst  $10                  ; KILL task $05 (task05_sprite_positions_13e2)
 16C0: 3E 01       ld   a,$01
-16C2: F7          rst  $30
+16C2: F7          rst  $30                  ; SLEEP 1 frame (yield)
 16C3: 06 F0       ld   b,$F0
-16C5: CD D8 02    call $02D8
+16C5: CD D8 02    call vec_set_video_enable_02d8
 16C8: 3E 04       ld   a,$04
-16CA: CF          rst  $08
+16CA: CF          rst  $08                  ; SPAWN task $04 (task04_scroll_117c)
 16CB: 3E 05       ld   a,$05
-16CD: CF          rst  $08
+16CD: CF          rst  $08                  ; SPAWN task $05 (task05_sprite_positions_13e2)
 16CE: 3E 09       ld   a,$09
-16D0: CF          rst  $08
+16D0: CF          rst  $08                  ; SPAWN task $09 (task09_s1_scroll_follow_170c)
 16D1: 3E 0A       ld   a,$0A
-16D3: CF          rst  $08
+16D3: CF          rst  $08                  ; SPAWN task $0A (task0a_s1_vine1_anim_1751)
 16D4: 3E 0B       ld   a,$0B
-16D6: CF          rst  $08
+16D6: CF          rst  $08                  ; SPAWN task $0B (task0b_s1_vine2_anim_179a)
 16D7: 3E 0C       ld   a,$0C
-16D9: CF          rst  $08
+16D9: CF          rst  $08                  ; SPAWN task $0C (task0c_s1_vine3_anim_17e2)
 16DA: 3E 0D       ld   a,$0D
-16DC: CF          rst  $08
+16DC: CF          rst  $08                  ; SPAWN task $0D (task0d_s1_vine_grab_18cf)
 16DD: 3E 0E       ld   a,$0E
-16DF: CF          rst  $08
+16DF: CF          rst  $08                  ; SPAWN task $0E (task0e_s1_fall_check_1a90)
 16E0: 3E 12       ld   a,$12
-16E2: CF          rst  $08
+16E2: CF          rst  $08                  ; SPAWN task $12 (task12_s1_end_zone_check_1c17)
 16E3: 3E 15       ld   a,$15
-16E5: CF          rst  $08
+16E5: CF          rst  $08                  ; SPAWN task $15 (task15_s1_landing_1d87)
 16E6: 3E 16       ld   a,$16
-16E8: CF          rst  $08
+16E8: CF          rst  $08                  ; SPAWN task $16 (task16_s1_hold_timeout_1f00)
 16E9: 3A A4 84    ld   a,($84A4)
 16EC: B7          or   a
 16ED: 20 17       jr   nz,$1706
-16EF: 3A 2B 84    ld   a,($842B)
+16EF: 3A 2B 84    ld   a,(attract_mode_842b)
 16F2: B7          or   a
 16F3: 20 11       jr   nz,$1706
 16F5: 3E C0       ld   a,$C0
-16F7: F7          rst  $30
+16F7: F7          rst  $30                  ; SLEEP 192 frames (yield)
 16F8: 3E 2F       ld   a,$2F
 16FA: 32 BE 83    ld   ($83BE),a
 16FD: 3C          inc  a
 16FE: 32 C2 83    ld   ($83C2),a
 1701: 3E 81       ld   a,$81
-1703: 32 3B 84    ld   ($843B),a
-1706: 3E 10       ld   a,$10
-1708: CF          rst  $08
-1709: 3E 08       ld   a,$08
-170B: D7          rst  $10
+1703: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $81
+1706: 3E 10       ld   a,$10                ; jump button task
+1708: CF          rst  $08                  ; SPAWN task $10 (task10_s1_jump_button_1b20)
+1709: 3E 08       ld   a,$08                ; kill myself
+170B: D7          rst  $10                  ; KILL task $08 (task08_s1_init_14ed)
+
+;----------------------------------------------------------------------------
+; === TASK $09 : moves vine segments / player together with the background scroll ===
+;----------------------------------------------------------------------------
+task09_s1_scroll_follow_170c:
 170C: 3E 01       ld   a,$01
-170E: F7          rst  $30
-170F: 3A 48 83    ld   a,($8348)
+170E: F7          rst  $30                  ; SLEEP 1 frame (yield)
+170F: 3A 48 83    ld   a,(layer_scroll_state_8348)
 1712: 4F          ld   c,a
 1713: 3A 98 84    ld   a,($8498)
 1716: CB 67       bit  4,a
 1718: 28 03       jr   z,$171D
-171A: CD 29 17    call $1729
+171A: CD 29 17    call s1_shift_vine_objects_1729
 171D: 3A 98 84    ld   a,($8498)
 1720: CB 6F       bit  5,a
 1722: 28 03       jr   z,$1727
-1724: CD 3D 17    call $173D
-1727: 18 E3       jr   $170C
+1724: CD 3D 17    call s1_shift_player_173d
+1727: 18 E3       jr   task09_s1_scroll_follow_170c
+
+s1_shift_vine_objects_1729:
 1729: 11 04 00    ld   de,$0004
 172C: 21 74 83    ld   hl,$8374
 172F: 06 12       ld   b,$12
@@ -3124,6 +3905,8 @@ music_sequencer_0c00:
 1739: 19          add  hl,de
 173A: 10 F5       djnz $1731
 173C: C9          ret
+
+s1_shift_player_173d:
 173D: 11 04 00    ld   de,$0004
 1740: 21 5C 83    ld   hl,$835C
 1743: 06 02       ld   b,$02
@@ -3137,8 +3920,16 @@ music_sequencer_0c00:
 174D: 19          add  hl,de
 174E: 10 F5       djnz $1745
 1750: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASKS $0A/$0B/$0C : SWING ANIMATION OF VINE 1/2/3 ===
+; Delay per round ($84C6..$84C8), 6 segments per step (182A). If the player
+; holds this vine he is moved with his grip segment. Sound $A1 at each end
+; of swing.
+;----------------------------------------------------------------------------
+task0a_s1_vine1_anim_1751:
 1751: 3A C6 84    ld   a,($84C6)
-1754: F7          rst  $30
+1754: F7          rst  $30                  ; SLEEP A frames (yield)
 1755: 2A B8 84    ld   hl,($84B8)
 1758: D9          exx
 1759: 21 73 83    ld   hl,$8373
@@ -3148,7 +3939,7 @@ music_sequencer_0c00:
 1764: DD 36 00 06 ld   (ix+$00),$06
 1768: 3A AA 84    ld   a,($84AA)
 176B: DD 77 01    ld   (ix+$01),a
-176E: CD 2A 18    call $182A
+176E: CD 2A 18    call s1_vine_anim_step_182a
 1771: 22 B8 84    ld   ($84B8),hl
 1774: 3A 9C 84    ld   a,($849C)
 1777: B7          or   a
@@ -3165,10 +3956,12 @@ music_sequencer_0c00:
 178F: CB 47       bit  0,a
 1791: 28 05       jr   z,$1798
 1793: 3E A1       ld   a,$A1
-1795: 32 0B D5    ld   ($D50B),a
-1798: 18 B7       jr   $1751
+1795: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A1
+1798: 18 B7       jr   task0a_s1_vine1_anim_1751
+
+task0b_s1_vine2_anim_179a:
 179A: 3A C7 84    ld   a,($84C7)
-179D: F7          rst  $30
+179D: F7          rst  $30                  ; SLEEP A frames (yield)
 179E: 2A BC 84    ld   hl,($84BC)
 17A1: D9          exx
 17A2: 21 8B 83    ld   hl,$838B
@@ -3178,7 +3971,7 @@ music_sequencer_0c00:
 17AD: DD 36 00 06 ld   (ix+$00),$06
 17B1: 3A AB 84    ld   a,($84AB)
 17B4: DD 77 01    ld   (ix+$01),a
-17B7: CD 2A 18    call $182A
+17B7: CD 2A 18    call s1_vine_anim_step_182a
 17BA: 22 BC 84    ld   ($84BC),hl
 17BD: 3A 9C 84    ld   a,($849C)
 17C0: B7          or   a
@@ -3194,10 +3987,12 @@ music_sequencer_0c00:
 17D7: CB 4F       bit  1,a
 17D9: 28 05       jr   z,$17E0
 17DB: 3E A1       ld   a,$A1
-17DD: 32 0B D5    ld   ($D50B),a
-17E0: 18 B8       jr   $179A
+17DD: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A1
+17E0: 18 B8       jr   task0b_s1_vine2_anim_179a
+
+task0c_s1_vine3_anim_17e2:
 17E2: 3A C8 84    ld   a,($84C8)
-17E5: F7          rst  $30
+17E5: F7          rst  $30                  ; SLEEP A frames (yield)
 17E6: 2A C0 84    ld   hl,($84C0)
 17E9: D9          exx
 17EA: 21 A3 83    ld   hl,$83A3
@@ -3207,7 +4002,7 @@ music_sequencer_0c00:
 17F5: DD 36 00 06 ld   (ix+$00),$06
 17F9: 3A AC 84    ld   a,($84AC)
 17FC: DD 77 01    ld   (ix+$01),a
-17FF: CD 2A 18    call $182A
+17FF: CD 2A 18    call s1_vine_anim_step_182a
 1802: 22 C0 84    ld   ($84C0),hl
 1805: 3A 9C 84    ld   a,($849C)
 1808: B7          or   a
@@ -3223,8 +4018,13 @@ music_sequencer_0c00:
 181F: CB 57       bit  2,a
 1821: 28 05       jr   z,$1828
 1823: 3E A1       ld   a,$A1
-1825: 32 0B D5    ld   ($D50B),a
-1828: 18 B8       jr   $17E2
+1825: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A1
+1828: 18 B8       jr   task0c_s1_vine3_anim_17e2
+
+;----------------------------------------------------------------------------
+; One vine animation step: 6 x [dx, dy, code, attr] records.
+;----------------------------------------------------------------------------
+s1_vine_anim_step_182a:
 182A: 46          ld   b,(hl)
 182B: 23          inc  hl
 182C: 4E          ld   c,(hl)
@@ -3336,15 +4136,22 @@ music_sequencer_0c00:
 18C4: AF          xor  a
 18C5: 32 9C 84    ld   ($849C),a
 18C8: DD 35 00    dec  (ix+$00)
-18CB: C2 2A 18    jp   nz,$182A
+18CB: C2 2A 18    jp   nz,s1_vine_anim_step_182a
 18CE: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $0D : VINE GRAB / SCROLL CONTROL ===
+; Scrolls when the player is on the left part of the screen, detects the
+; grip on the next vine (+100 pts), and the monkey contact (death).
+;----------------------------------------------------------------------------
+task0d_s1_vine_grab_18cf:
 18CF: 3E 01       ld   a,$01
-18D1: F7          rst  $30
+18D1: F7          rst  $30                  ; SLEEP 1 frame (yield)
 18D2: 3A 5C 83    ld   a,($835C)
 18D5: FE 60       cp   $60
 18D7: 30 23       jr   nc,$18FC
 18D9: 3E 07       ld   a,$07
-18DB: 32 45 83    ld   ($8345),a
+18DB: 32 45 83    ld   (scroll_speed_8345),a
 18DE: 3A 98 84    ld   a,($8498)
 18E1: CB E7       set  4,a
 18E3: 32 98 84    ld   ($8498),a
@@ -3352,7 +4159,7 @@ music_sequencer_0c00:
 18E9: FE 30       cp   $30
 18EB: 30 0F       jr   nc,$18FC
 18ED: 3E 07       ld   a,$07
-18EF: 32 45 83    ld   ($8345),a
+18EF: 32 45 83    ld   (scroll_speed_8345),a
 18F2: 3A 98 84    ld   a,($8498)
 18F5: F6 90       or   $90
 18F7: 32 98 84    ld   ($8498),a
@@ -3367,13 +4174,13 @@ music_sequencer_0c00:
 190C: 21 8C 83    ld   hl,$838C
 190F: 18 07       jr   $1918
 1911: CB 57       bit  2,a
-1913: 28 BA       jr   z,$18CF
+1913: 28 BA       jr   z,task0d_s1_vine_grab_18cf
 1915: 21 A4 83    ld   hl,$83A4
 1918: 7E          ld   a,(hl)
 1919: FE B4       cp   $B4
 191B: 38 04       jr   c,$1921
 191D: AF          xor  a
-191E: 32 45 83    ld   ($8345),a
+191E: 32 45 83    ld   (scroll_speed_8345),a
 1921: 3A 99 84    ld   a,($8499)
 1924: CB 57       bit  2,a
 1926: 20 0C       jr   nz,$1934
@@ -3381,16 +4188,16 @@ music_sequencer_0c00:
 192A: C2 82 19    jp   nz,$1982
 192D: CB 4F       bit  1,a
 192F: C2 C2 19    jp   nz,$19C2
-1932: 18 9B       jr   $18CF
+1932: 18 9B       jr   task0d_s1_vine_grab_18cf
 1934: 21 73 83    ld   hl,$8373
 1937: 3A 5E 83    ld   a,($835E)
 193A: 4F          ld   c,a
 193B: 3A 5C 83    ld   a,($835C)
-193E: CD 54 1A    call $1A54
+193E: CD 54 1A    call s1_find_grip_segment_1a54
 1941: 78          ld   a,b
 1942: 32 AA 84    ld   ($84AA),a
 1945: FE 0F       cp   $0F
-1947: CA F1 19    jp   z,$19F1
+1947: CA F1 19    jp   z,s1_monkey_touch_check_19f1
 194A: 3E 32       ld   a,$32
 194C: 32 98 84    ld   ($8498),a
 194F: 3E 01       ld   a,$01
@@ -3398,11 +4205,11 @@ music_sequencer_0c00:
 1954: AF          xor  a
 1955: 32 9B 84    ld   ($849B),a
 1958: 3E 11       ld   a,$11
-195A: D7          rst  $10
+195A: D7          rst  $10                  ; KILL task $11 (task11_s1_player_path_1b8c)
 195B: 06 0A       ld   b,$0A
-195D: 3A 74 81    ld   a,($8174)
+195D: 3A 74 81    ld   a,(pending_score_ticks_8174)
 1960: 80          add  a,b
-1961: 32 74 81    ld   ($8174),a
+1961: 32 74 81    ld   (pending_score_ticks_8174),a
 1964: 3A 9D 84    ld   a,($849D)
 1967: B7          or   a
 1968: 28 15       jr   z,$197F
@@ -3410,27 +4217,27 @@ music_sequencer_0c00:
 196D: FE 1A       cp   $1A
 196F: 20 0E       jr   nz,$197F
 1971: 06 0A       ld   b,$0A
-1973: 3A 74 81    ld   a,($8174)
+1973: 3A 74 81    ld   a,(pending_score_ticks_8174)
 1976: 80          add  a,b
-1977: 32 74 81    ld   ($8174),a
+1977: 32 74 81    ld   (pending_score_ticks_8174),a
 197A: 3E B9       ld   a,$B9
-197C: 32 0B D5    ld   ($D50B),a
-197F: C3 F1 19    jp   $19F1
+197C: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $B9
+197F: C3 F1 19    jp   s1_monkey_touch_check_19f1
 1982: 21 8B 83    ld   hl,$838B
 1985: 3A 5E 83    ld   a,($835E)
 1988: 4F          ld   c,a
 1989: 3A 5C 83    ld   a,($835C)
-198C: CD 54 1A    call $1A54
+198C: CD 54 1A    call s1_find_grip_segment_1a54
 198F: 78          ld   a,b
 1990: 32 AB 84    ld   ($84AB),a
 1993: FE 0F       cp   $0F
-1995: CA F1 19    jp   z,$19F1
+1995: CA F1 19    jp   z,s1_monkey_touch_check_19f1
 1998: 3A 9A 84    ld   a,($849A)
 199B: B7          or   a
 199C: 20 08       jr   nz,$19A6
 199E: 3E 01       ld   a,$01
 19A0: 32 9A 84    ld   ($849A),a
-19A3: CD 46 1A    call $1A46
+19A3: CD 46 1A    call s1_reset_vine3_flags_1a46
 19A6: 3E 32       ld   a,$32
 19A8: 32 98 84    ld   ($8498),a
 19AB: 3E 02       ld   a,$02
@@ -3438,21 +4245,21 @@ music_sequencer_0c00:
 19B0: AF          xor  a
 19B1: 32 9B 84    ld   ($849B),a
 19B4: 3E 11       ld   a,$11
-19B6: D7          rst  $10
+19B6: D7          rst  $10                  ; KILL task $11 (task11_s1_player_path_1b8c)
 19B7: 06 0A       ld   b,$0A
-19B9: 3A 74 81    ld   a,($8174)
+19B9: 3A 74 81    ld   a,(pending_score_ticks_8174)
 19BC: 80          add  a,b
-19BD: 32 74 81    ld   ($8174),a
-19C0: 18 2F       jr   $19F1
+19BD: 32 74 81    ld   (pending_score_ticks_8174),a
+19C0: 18 2F       jr   s1_monkey_touch_check_19f1
 19C2: 21 A3 83    ld   hl,$83A3
 19C5: 3A 5E 83    ld   a,($835E)
 19C8: 4F          ld   c,a
 19C9: 3A 5C 83    ld   a,($835C)
-19CC: CD 54 1A    call $1A54
+19CC: CD 54 1A    call s1_find_grip_segment_1a54
 19CF: 78          ld   a,b
 19D0: 32 AC 84    ld   ($84AC),a
 19D3: FE 0F       cp   $0F
-19D5: 28 1A       jr   z,$19F1
+19D5: 28 1A       jr   z,s1_monkey_touch_check_19f1
 19D7: 3E 32       ld   a,$32
 19D9: 32 98 84    ld   ($8498),a
 19DC: 3E 04       ld   a,$04
@@ -3460,11 +4267,13 @@ music_sequencer_0c00:
 19E1: AF          xor  a
 19E2: 32 9B 84    ld   ($849B),a
 19E5: 3E 11       ld   a,$11
-19E7: D7          rst  $10
+19E7: D7          rst  $10                  ; KILL task $11 (task11_s1_player_path_1b8c)
 19E8: 06 0A       ld   b,$0A
-19EA: 3A 74 81    ld   a,($8174)
+19EA: 3A 74 81    ld   a,(pending_score_ticks_8174)
 19ED: 80          add  a,b
-19EE: 32 74 81    ld   ($8174),a
+19EE: 32 74 81    ld   (pending_score_ticks_8174),a
+
+s1_monkey_touch_check_19f1:
 19F1: 3A 98 84    ld   a,($8498)
 19F4: E6 08       and  $08
 19F6: 20 4B       jr   nz,$1A43
@@ -3490,7 +4299,7 @@ music_sequencer_0c00:
 1A1E: FE 00       cp   $00
 1A20: 38 21       jr   c,$1A43
 1A22: 3E BA       ld   a,$BA
-1A24: 32 0B D5    ld   ($D50B),a
+1A24: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $BA
 1A27: 2A CE 84    ld   hl,($84CE)
 1A2A: 22 B6 84    ld   ($84B6),hl
 1A2D: AF          xor  a
@@ -3498,14 +4307,16 @@ music_sequencer_0c00:
 1A31: 3C          inc  a
 1A32: 32 A6 84    ld   ($84A6),a
 1A35: 3E 11       ld   a,$11
-1A37: D7          rst  $10
+1A37: D7          rst  $10                  ; KILL task $11 (task11_s1_player_path_1b8c)
 1A38: 3E 11       ld   a,$11
-1A3A: CF          rst  $08
+1A3A: CF          rst  $08                  ; SPAWN task $11 (task11_s1_player_path_1b8c)
 1A3B: 3E 0D       ld   a,$0D
-1A3D: D7          rst  $10
+1A3D: D7          rst  $10                  ; KILL task $0D (task0d_s1_vine_grab_18cf)
 1A3E: 3E 08       ld   a,$08
 1A40: 32 98 84    ld   ($8498),a
-1A43: C3 CF 18    jp   $18CF
+1A43: C3 CF 18    jp   task0d_s1_vine_grab_18cf
+
+s1_reset_vine3_flags_1a46:
 1A46: 11 04 00    ld   de,$0004
 1A49: 21 A5 83    ld   hl,$83A5
 1A4C: AF          xor  a
@@ -3514,6 +4325,11 @@ music_sequencer_0c00:
 1A50: 19          add  hl,de
 1A51: 10 FC       djnz $1A4F
 1A53: C9          ret
+
+;----------------------------------------------------------------------------
+; Find which of the 6 segments of a vine (HL) the player (A=x, C=y) can grab. out: B = segment (or $0F = none). Sound $8E + restart of the hold timeout.
+;----------------------------------------------------------------------------
+s1_find_grip_segment_1a54:
 1A54: 57          ld   d,a
 1A55: 59          ld   e,c
 1A56: 06 06       ld   b,$06
@@ -3534,11 +4350,11 @@ music_sequencer_0c00:
 1A6C: FE EF       cp   $EF
 1A6E: 38 13       jr   c,$1A83
 1A70: 3E 8E       ld   a,$8E
-1A72: 32 0B D5    ld   ($D50B),a
+1A72: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $8E
 1A75: 3E 16       ld   a,$16
-1A77: D7          rst  $10
+1A77: D7          rst  $10                  ; KILL task $16 (task16_s1_hold_timeout_1f00)
 1A78: 3E 16       ld   a,$16
-1A7A: CF          rst  $08
+1A7A: CF          rst  $08                  ; SPAWN task $16 (task16_s1_hold_timeout_1f00)
 1A7B: 18 0B       jr   $1A88
 1A7D: 2B          dec  hl
 1A7E: 2B          dec  hl
@@ -3555,8 +4371,13 @@ music_sequencer_0c00:
 1A8B: 20 02       jr   nz,$1A8F
 1A8D: 06 01       ld   b,$01
 1A8F: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $0E : player fell to the bottom -> death (spawns $14, never returns: death scroll) ===
+;----------------------------------------------------------------------------
+task0e_s1_fall_check_1a90:
 1A90: 3E 01       ld   a,$01
-1A92: F7          rst  $30
+1A92: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1A93: 3A 62 83    ld   a,($8362)
 1A96: FE 0C       cp   $0C
 1A98: 30 23       jr   nc,$1ABD
@@ -3569,17 +4390,22 @@ music_sequencer_0c00:
 1AAA: 3D          dec  a
 1AAB: 32 C2 83    ld   ($83C2),a
 1AAE: 3E 04       ld   a,$04
-1AB0: D7          rst  $10
+1AB0: D7          rst  $10                  ; KILL task $04 (task04_scroll_117c)
 1AB1: 3E 09       ld   a,$09
-1AB3: D7          rst  $10
+1AB3: D7          rst  $10                  ; KILL task $09 (task09_s1_scroll_follow_170c)
 1AB4: 3E 11       ld   a,$11
-1AB6: D7          rst  $10
+1AB6: D7          rst  $10                  ; KILL task $11 (task11_s1_player_path_1b8c)
 1AB7: 3E 14       ld   a,$14
-1AB9: CF          rst  $08
-1ABA: C3 30 30    jp   $3030
-1ABD: 18 D1       jr   $1A90
+1AB9: CF          rst  $08                  ; SPAWN task $14 (task14_s1_life_lost_1d4b)
+1ABA: C3 30 30    jp   vector_death_scroll_3030  ; -> death_scroll_loop_5870
+1ABD: 18 D1       jr   task0e_s1_fall_check_1a90
+
+;----------------------------------------------------------------------------
+; === TASK $0F : player landed at the end -> STAGE CLEAR (+500 unless died), event 0 ===
+;----------------------------------------------------------------------------
+task0f_s1_stage_clear_1abf:
 1ABF: 3E 01       ld   a,$01
-1AC1: F7          rst  $30
+1AC1: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1AC2: 3A 62 83    ld   a,($8362)
 1AC5: FE 10       cp   $10
 1AC7: 30 55       jr   nc,$1B1E
@@ -3587,23 +4413,23 @@ music_sequencer_0c00:
 1ACC: B7          or   a
 1ACD: 20 09       jr   nz,$1AD8
 1ACF: 06 32       ld   b,$32
-1AD1: 3A 74 81    ld   a,($8174)
+1AD1: 3A 74 81    ld   a,(pending_score_ticks_8174)
 1AD4: 80          add  a,b
-1AD5: 32 74 81    ld   ($8174),a
+1AD5: 32 74 81    ld   (pending_score_ticks_8174),a
 1AD8: 3E 80       ld   a,$80
-1ADA: 32 3B 84    ld   ($843B),a
+1ADA: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 1ADD: 3E 8F       ld   a,$8F
-1ADF: 32 0B D5    ld   ($D50B),a
+1ADF: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $8F
 1AE2: 3E FF       ld   a,$FF
-1AE4: 32 5A 83    ld   ($835A),a
+1AE4: 32 5A 83    ld   (scroll_mode_835a),a
 1AE7: 3E 00       ld   a,$00
-1AE9: 32 34 84    ld   ($8434),a
+1AE9: 32 34 84    ld   (player_died_8434),a
 1AEC: 3E 00       ld   a,$00
-1AEE: EF          rst  $28
-1AEF: D9          exx
+1AEE: EF          rst  $28                  ; SIGNAL event $00 - event 0 : stage finished
+1AEF: D9          exx                       ; generic 'kill myself' (C' = my ID)
 1AF0: 79          ld   a,c
 1AF1: D9          exx
-1AF2: D7          rst  $10
+1AF2: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
 1AF3: 3A 5C 83    ld   a,($835C)
 1AF6: C6 10       add  a,$10
 1AF8: 32 6C 83    ld   ($836C),a
@@ -3620,16 +4446,21 @@ music_sequencer_0c00:
 1B12: 32 CE 83    ld   ($83CE),a
 1B15: 32 D2 83    ld   ($83D2),a
 1B18: 3E 1E       ld   a,$1E
-1B1A: F7          rst  $30
+1B1A: F7          rst  $30                  ; SLEEP 30 frames (yield)
 1B1B: 3E 0F       ld   a,$0F
-1B1D: D7          rst  $10
-1B1E: 18 9F       jr   $1ABF
+1B1D: D7          rst  $10                  ; KILL task $0F (task0f_s1_stage_clear_1abf)
+1B1E: 18 9F       jr   task0f_s1_stage_clear_1abf
+
+;----------------------------------------------------------------------------
+; === TASK $10 : JUMP BUTTON on a vine (edge detected) -> spawns $11 with a jump path ===
+;----------------------------------------------------------------------------
+task10_s1_jump_button_1b20:
 1B20: 3E 01       ld   a,$01
-1B22: F7          rst  $30
+1B22: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1B23: 3A 98 84    ld   a,($8498)
 1B26: E6 03       and  $03
 1B28: 28 1D       jr   z,$1B47
-1B2A: 3A D8 81    ld   a,($81D8)
+1B2A: 3A D8 81    ld   a,(joystick_input_81d8)
 1B2D: CB 67       bit  4,a
 1B2F: 20 16       jr   nz,$1B47
 1B31: 3A A8 84    ld   a,($84A8)
@@ -3638,14 +4469,16 @@ music_sequencer_0c00:
 1B38: AF          xor  a
 1B39: 32 9B 84    ld   ($849B),a
 1B3C: 3E 8D       ld   a,$8D
-1B3E: 32 0B D5    ld   ($D50B),a
-1B41: CD 4F 1B    call $1B4F
+1B3E: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $8D
+1B41: CD 4F 1B    call s1_select_jump_path_1b4f
 1B44: 3E 11       ld   a,$11
-1B46: CF          rst  $08
-1B47: 3A D8 81    ld   a,($81D8)
+1B46: CF          rst  $08                  ; SPAWN task $11 (task11_s1_player_path_1b8c)
+1B47: 3A D8 81    ld   a,(joystick_input_81d8)
 1B4A: 32 A8 84    ld   ($84A8),a
-1B4D: 18 D1       jr   $1B20
-1B4F: 3A D8 81    ld   a,($81D8)
+1B4D: 18 D1       jr   task10_s1_jump_button_1b20
+
+s1_select_jump_path_1b4f:
+1B4F: 3A D8 81    ld   a,(joystick_input_81d8)
 1B52: CB 47       bit  0,a
 1B54: 20 05       jr   nz,$1B5B
 1B56: 2A CA 84    ld   hl,($84CA)
@@ -3673,12 +4506,17 @@ music_sequencer_0c00:
 1B85: 2A D2 84    ld   hl,($84D2)
 1B88: 22 B6 84    ld   ($84B6),hl
 1B8B: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $11 : player path follower (jump / fall / landing): [dx, dy, repeat, code] records from $84B6 ===
+;----------------------------------------------------------------------------
+task11_s1_player_path_1b8c:
 1B8C: 3E 01       ld   a,$01
-1B8E: F7          rst  $30
+1B8E: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1B8F: 2A B6 84    ld   hl,($84B6)
 1B92: 7C          ld   a,h
 1B93: B7          or   a
-1B94: 28 F6       jr   z,$1B8C
+1B94: 28 F6       jr   z,task11_s1_player_path_1b8c
 1B96: 3E 0F       ld   a,$0F
 1B98: 32 AA 84    ld   ($84AA),a
 1B9B: 32 AB 84    ld   ($84AB),a
@@ -3743,31 +4581,41 @@ music_sequencer_0c00:
 1C0E: B7          or   a
 1C0F: 20 03       jr   nz,$1C14
 1C11: 22 B6 84    ld   ($84B6),hl
-1C14: C3 8C 1B    jp   $1B8C
+1C14: C3 8C 1B    jp   task11_s1_player_path_1b8c
+
+;----------------------------------------------------------------------------
+; === TASK $12 : end zone reached (distance >= $84C9) -> spawns $13 ===
+;----------------------------------------------------------------------------
+task12_s1_end_zone_check_1c17:
 1C17: 3E 01       ld   a,$01
-1C19: F7          rst  $30
+1C19: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1C1A: 3A C9 84    ld   a,($84C9)
 1C1D: 47          ld   b,a
-1C1E: 3A 58 83    ld   a,($8358)
+1C1E: 3A 58 83    ld   a,(distance_lo_8358)
 1C21: B8          cp   b
 1C22: 38 0E       jr   c,$1C32
 1C24: 3E 01       ld   a,$01
 1C26: 32 9D 84    ld   ($849D),a
 1C29: 3E 0E       ld   a,$0E
-1C2B: D7          rst  $10
+1C2B: D7          rst  $10                  ; KILL task $0E (task0e_s1_fall_check_1a90)
 1C2C: 3E 13       ld   a,$13
-1C2E: CF          rst  $08
+1C2E: CF          rst  $08                  ; SPAWN task $13 (task13_s1_monkey_1c38)
 1C2F: 3E 12       ld   a,$12
-1C31: D7          rst  $10
+1C31: D7          rst  $10                  ; KILL task $12 (task12_s1_end_zone_check_1c17)
 1C32: AF          xor  a
 1C33: 32 9D 84    ld   ($849D),a
-1C36: 18 DF       jr   $1C17
+1C36: 18 DF       jr   task12_s1_end_zone_check_1c17
+
+;----------------------------------------------------------------------------
+; === TASK $13 : MONKEY climbing the vines (last part of the stage) ===
+;----------------------------------------------------------------------------
+task13_s1_monkey_1c38:
 1C38: 3E 01       ld   a,$01
-1C3A: F7          rst  $30
+1C3A: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1C3B: 3E 0E       ld   a,$0E
-1C3D: CF          rst  $08
+1C3D: CF          rst  $08                  ; SPAWN task $0E (task0e_s1_fall_check_1a90)
 1C3E: 3E 01       ld   a,$01
-1C40: F7          rst  $30
+1C40: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1C41: 21 83 83    ld   hl,$8383
 1C44: 7E          ld   a,(hl)
 1C45: B7          or   a
@@ -3775,10 +4623,10 @@ music_sequencer_0c00:
 1C48: 3A 9E 84    ld   a,($849E)
 1C4B: B7          or   a
 1C4C: 20 03       jr   nz,$1C51
-1C4E: CD 71 1C    call $1C71
+1C4E: CD 71 1C    call s1_monkey_next_vine_1c71
 1C51: 3E 01       ld   a,$01
 1C53: 32 9E 84    ld   ($849E),a
-1C56: CD 19 1D    call $1D19
+1C56: CD 19 1D    call s1_monkey_follow_vine_1d19
 1C59: 21 83 83    ld   hl,$8383
 1C5C: 7E          ld   a,(hl)
 1C5D: B7          or   a
@@ -3787,10 +4635,12 @@ music_sequencer_0c00:
 1C63: B7          or   a
 1C64: 28 06       jr   z,$1C6C
 1C66: 3E B7       ld   a,$B7
-1C68: 32 0B D5    ld   ($D50B),a
+1C68: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $B7
 1C6B: AF          xor  a
 1C6C: 32 9F 84    ld   ($849F),a
 1C6F: 18 CD       jr   $1C3E
+
+s1_monkey_next_vine_1c71:
 1C71: 01 04 00    ld   bc,$0004
 1C74: 21 73 83    ld   hl,$8373
 1C77: 3A A5 84    ld   a,($84A5)
@@ -3886,6 +4736,8 @@ music_sequencer_0c00:
 1D13: CB D7       set  2,a
 1D15: 32 A0 84    ld   ($84A0),a
 1D18: C9          ret
+
+s1_monkey_follow_vine_1d19:
 1D19: 3A A0 84    ld   a,($84A0)
 1D1C: CB 57       bit  2,a
 1D1E: 28 2A       jr   z,$1D4A
@@ -3920,43 +4772,54 @@ music_sequencer_0c00:
 1D46: AF          xor  a
 1D47: 32 69 83    ld   ($8369),a
 1D4A: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $14 : LIFE LOST (stage 1) ===  saves the checkpoint distance
+; ($81D9/$81DB P1, $81DD/$81DF P2), $8434=$FF, signals event 0, dies.
+;----------------------------------------------------------------------------
+task14_s1_life_lost_1d4b:
 1D4B: 3E 01       ld   a,$01
-1D4D: F7          rst  $30
+1D4D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1D4E: 3E 80       ld   a,$80
-1D50: 32 3B 84    ld   ($843B),a
+1D50: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 1D53: 3E 30       ld   a,$30
-1D55: F7          rst  $30
-1D56: 3A 56 81    ld   a,($8156)
+1D55: F7          rst  $30                  ; SLEEP 48 frames (yield)
+1D56: 3A 56 81    ld   a,(cur_player_8156)
 1D59: B7          or   a
 1D5A: 28 0E       jr   z,$1D6A
-1D5C: 2A 56 83    ld   hl,($8356)
+1D5C: 2A 56 83    ld   hl,(distance_hi_8356)
 1D5F: 22 D9 81    ld   ($81D9),hl
-1D62: 2A 58 83    ld   hl,($8358)
+1D62: 2A 58 83    ld   hl,(distance_lo_8358)
 1D65: 22 DB 81    ld   ($81DB),hl
 1D68: 18 0C       jr   $1D76
-1D6A: 2A 56 83    ld   hl,($8356)
+1D6A: 2A 56 83    ld   hl,(distance_hi_8356)
 1D6D: 22 DD 81    ld   ($81DD),hl
-1D70: 2A 58 83    ld   hl,($8358)
+1D70: 2A 58 83    ld   hl,(distance_lo_8358)
 1D73: 22 DF 81    ld   ($81DF),hl
 1D76: 3E FF       ld   a,$FF
-1D78: 32 5A 83    ld   ($835A),a
+1D78: 32 5A 83    ld   (scroll_mode_835a),a
 1D7B: 3E FF       ld   a,$FF
-1D7D: 32 34 84    ld   ($8434),a
+1D7D: 32 34 84    ld   (player_died_8434),a
 1D80: 3E 00       ld   a,$00
-1D82: EF          rst  $28
-1D83: D9          exx
+1D82: EF          rst  $28                  ; SIGNAL event $00 - event 0 : life lost
+1D83: D9          exx                       ; generic 'kill myself'
 1D84: 79          ld   a,c
 1D85: D9          exx
-1D86: D7          rst  $10
+1D86: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
+
+;----------------------------------------------------------------------------
+; === TASK $15 : detect ground under the player at the end -> landing path, spawns $0F ===
+;----------------------------------------------------------------------------
+task15_s1_landing_1d87:
 1D87: 3E 01       ld   a,$01
-1D89: F7          rst  $30
+1D89: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1D8A: AF          xor  a
 1D8B: 32 A9 84    ld   ($84A9),a
 1D8E: 3A 5C 83    ld   a,($835C)
 1D91: FE F0       cp   $F0
-1D93: 30 F2       jr   nc,$1D87
+1D93: 30 F2       jr   nc,task15_s1_landing_1d87
 1D95: 47          ld   b,a
-1D96: 3A FB 82    ld   a,($82FB)
+1D96: 3A FB 82    ld   a,(scroll_l2_x_82fb)
 1D99: C6 04       add  a,$04
 1D9B: 80          add  a,b
 1D9C: E6 F8       and  $F8
@@ -3970,11 +4833,11 @@ music_sequencer_0c00:
 1DA8: 6F          ld   l,a
 1DA9: 7E          ld   a,(hl)
 1DAA: E6 02       and  $02
-1DAC: 28 D9       jr   z,$1D87
+1DAC: 28 D9       jr   z,task15_s1_landing_1d87
 1DAE: 3E 10       ld   a,$10
-1DB0: D7          rst  $10
+1DB0: D7          rst  $10                  ; KILL task $10 (task10_s1_jump_button_1b20)
 1DB1: 3E 0E       ld   a,$0E
-1DB3: D7          rst  $10
+1DB3: D7          rst  $10                  ; KILL task $0E (task0e_s1_fall_check_1a90)
 1DB4: 3A A6 84    ld   a,($84A6)
 1DB7: B7          or   a
 1DB8: 20 24       jr   nz,$1DDE
@@ -3992,22 +4855,26 @@ music_sequencer_0c00:
 1DD6: D6 10       sub  $10
 1DD8: 32 5C 83    ld   ($835C),a
 1DDB: 3E 11       ld   a,$11
-1DDD: CF          rst  $08
+1DDD: CF          rst  $08                  ; SPAWN task $11 (task11_s1_player_path_1b8c)
 1DDE: 3E 0F       ld   a,$0F
-1DE0: CF          rst  $08
+1DE0: CF          rst  $08                  ; SPAWN task $0F (task0f_s1_stage_clear_1abf)
 1DE1: 3E 80       ld   a,$80
-1DE3: 32 3B 84    ld   ($843B),a
+1DE3: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 1DE6: 3E A3       ld   a,$A3
-1DE8: 32 0B D5    ld   ($D50B),a
+1DE8: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A3
 1DEB: 3E 15       ld   a,$15
-1DED: D7          rst  $10
+1DED: D7          rst  $10                  ; KILL task $15 (task15_s1_landing_1d87)
 
+;----------------------------------------------------------------------------
+; === TASK $16 : vine hold timeout (8 x 256 frames) -> the player drops ===
+;----------------------------------------------------------------------------
+task16_s1_hold_timeout_1f00:
 1F00: 3E 01       ld   a,$01
-1F02: F7          rst  $30
+1F02: F7          rst  $30                  ; SLEEP 1 frame (yield)
 1F03: AF          xor  a
 1F04: 32 AD 84    ld   ($84AD),a
 1F07: 3E 00       ld   a,$00
-1F09: F7          rst  $30
+1F09: F7          rst  $30                  ; SLEEP 256 frames (yield)
 1F0A: 3A AD 84    ld   a,($84AD)
 1F0D: 3C          inc  a
 1F0E: 32 AD 84    ld   ($84AD),a
@@ -4019,40 +4886,96 @@ music_sequencer_0c00:
 1F1D: 21 40 4B    ld   hl,$4B40
 1F20: 22 B6 84    ld   ($84B6),hl
 1F23: 3E 10       ld   a,$10
-1F25: D7          rst  $10
+1F25: D7          rst  $10                  ; KILL task $10 (task10_s1_jump_button_1b20)
 1F26: 3E 11       ld   a,$11
-1F28: CF          rst  $08
+1F28: CF          rst  $08                  ; SPAWN task $11 (task11_s1_player_path_1b8c)
 1F29: 3E 16       ld   a,$16
-1F2B: D7          rst  $10
+1F2B: D7          rst  $10                  ; KILL task $16 (task16_s1_hold_timeout_1f00)
 
-2000: C3 00 00    jp   $0000
-2003: C3 00 00    jp   $0000
-2006: C3 00 00    jp   $0000
-2009: C3 00 00    jp   $0000
-200C: C3 71 25    jp   $2571
-200F: C3 F8 25    jp   $25F8
-2012: C3 18 25    jp   $2518
-2015: C3 42 25    jp   $2542
-2018: C3 42 20    jp   $2042
-201B: C3 C8 22    jp   $22C8
-201E: C3 CD 26    jp   $26CD
-2021: C3 4E 27    jp   $274E
-2024: C3 87 25    jp   $2587
-2027: C3 F9 27    jp   $27F9
-202A: C3 00 00    jp   $0000
-202D: C3 00 00    jp   $0000
-2030: C3 30 22    jp   $2230
-2033: C3 7E 22    jp   $227E
-2036: C3 DA 21    jp   $21DA
-2039: C3 6C 25    jp   $256C
-203C: C3 7B 2B    jp   $2B7B
-203F: C3 00 00    jp   $0000
+;----------------------------------------------------------------------------
+; Task entry vectors of stage 2 (IDs $18..$25, $18-$1B unused). NOTE: the
+; last 5 entries (2030..203C) are IDs $2A..$2E, not $28..$2C: the ID->entry
+; table at $7F60 is not linear, see the file header.
+;----------------------------------------------------------------------------
+vec_unused_2000:
+2000: C3 00 00    jp   reset_0000
+
+vec_unused_2003:
+2003: C3 00 00    jp   reset_0000
+
+vec_unused_2006:
+2006: C3 00 00    jp   reset_0000
+
+vec_unused_2009:
+2009: C3 00 00    jp   reset_0000
+
+vec_task1c_200c:
+200C: C3 71 25    jp   task1c_s2_delayed_stab_2571
+
+vec_task1d_200f:
+200F: C3 F8 25    jp   task1d_s2_stab_hit_check_25f8
+
+vec_task1e_2012:
+2012: C3 18 25    jp   task1e_s2_dive_2518
+
+vec_task1f_2015:
+2015: C3 42 25    jp   task1f_s2_rise_2542
+
+vec_task20_2018:
+2018: C3 42 20    jp   task20_s2_init_2042
+
+vec_task21_201b:
+201B: C3 C8 22    jp   task21_s2_player_control_22c8
+
+vec_task22_201e:
+201E: C3 CD 26    jp   task22_s2_air_meter_26cd
+
+vec_task23_2021:
+2021: C3 4E 27    jp   task23_s2_death_274e
+
+vec_task24_2024:
+2024: C3 87 25    jp   task24_s2_knife_stab_2587
+
+vec_task25_2027:
+2027: C3 F9 27    jp   task25_s2_world_update_27f9
+
+vec_unused_202a:
+202A: C3 00 00    jp   reset_0000
+
+vec_unused_202d:
+202D: C3 00 00    jp   reset_0000
+
+vec_task2a_2030:
+2030: C3 30 22    jp   task2a_s2_swim_forward_2230
+
+vec_task2b_2033:
+2033: C3 7E 22    jp   task2b_s2_swim_back_227e
+
+vec_task2c_2036:
+2036: C3 DA 21    jp   task2c_s2_drift_21da
+
+vec_task2d_2039:
+2039: C3 6C 25    jp   task2d_s2_idle_256c
+
+vec_task2e_203c:
+203C: C3 7B 2B    jp   task2e_s2_objects_2b7b
+
+vec_unused_203f:
+203F: C3 00 00    jp   reset_0000
+
+;----------------------------------------------------------------------------
+; === TASK $20 : STAGE 2 (RIVER) INIT ===  in: C = round, F.Z = fresh
+; Parameters $5FA0 table -> $8467 (x limits, speeds, surface/bottom y...),
+; checkpoint $81E1/$81E5, map $5C00/$5C80, air meter status line, objects,
+; then spawns $2C,$21,$25,$04,$05,$2E and kills itself.
+;----------------------------------------------------------------------------
+task20_s2_init_2042:
 2042: 3E 01       ld   a,$01
-2044: F7          rst  $30
+2044: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2045: 08          ex   af,af'
 2046: C5          push bc
 2047: 06 00       ld   b,$00
-2049: CD D8 02    call $02D8
+2049: CD D8 02    call vec_set_video_enable_02d8
 204C: C1          pop  bc
 204D: 79          ld   a,c
 204E: 3D          dec  a
@@ -4073,7 +4996,7 @@ music_sequencer_0c00:
 2063: 01 10 00    ld   bc,$0010
 2066: ED B0       ldir
 2068: 21 E1 81    ld   hl,$81E1
-206B: 3A 56 81    ld   a,($8156)
+206B: 3A 56 81    ld   a,(cur_player_8156)
 206E: A7          and  a
 206F: 20 04       jr   nz,$2075
 2071: 01 04 00    ld   bc,$0004
@@ -4083,7 +5006,7 @@ music_sequencer_0c00:
 2078: 01 00 00    ld   bc,$0000
 207B: 18 11       jr   $208E
 207D: 3E 91       ld   a,$91
-207F: 32 0B D5    ld   ($D50B),a
+207F: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $91
 2082: 46          ld   b,(hl)
 2083: 23          inc  hl
 2084: 7E          ld   a,(hl)
@@ -4109,11 +5032,11 @@ music_sequencer_0c00:
 209F: 21 00 5C    ld   hl,$5C00
 20A2: 11 80 5C    ld   de,$5C80
 20A5: AF          xor  a
-20A6: 32 5A 83    ld   ($835A),a
-20A9: CD DB 02    call $02DB
+20A6: 32 5A 83    ld   (scroll_mode_835a),a
+20A9: CD DB 02    call vec_init_scrolling_map_02db
 20AC: D1          pop  de
 20AD: C1          pop  bc
-20AE: 21 56 83    ld   hl,$8356
+20AE: 21 56 83    ld   hl,distance_hi_8356
 20B1: 70          ld   (hl),b
 20B2: 23          inc  hl
 20B3: 23          inc  hl
@@ -4155,12 +5078,12 @@ music_sequencer_0c00:
 20ED: 77          ld   (hl),a
 20EE: 23          inc  hl
 20EF: 77          ld   (hl),a
-20F0: 21 37 84    ld   hl,$8437
+20F0: 21 37 84    ld   hl,surface_anim_ptr_8437
 20F3: 11 00 52    ld   de,$5200
 20F6: 72          ld   (hl),d
 20F7: 23          inc  hl
 20F8: 73          ld   (hl),e
-20F9: 11 58 84    ld   de,$8458
+20F9: 11 58 84    ld   de,status_line_8458
 20FC: 21 90 5E    ld   hl,$5E90
 20FF: 01 06 00    ld   bc,$0006
 2102: ED B0       ldir
@@ -4171,14 +5094,14 @@ music_sequencer_0c00:
 2109: 01 05 00    ld   bc,$0005
 210C: ED B0       ldir
 210E: 3E 01       ld   a,$01
-2110: F7          rst  $30
+2110: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2111: 3E 08       ld   a,$08
-2113: 32 00 D3    ld   ($D300),a
+2113: 32 00 D3    ld   (priority_d300),a
 2116: 06 70       ld   b,$70
-2118: CD D8 02    call $02D8
+2118: CD D8 02    call vec_set_video_enable_02d8
 211B: DD 21 67 84 ld   ix,$8467
 211F: DD 7E 06    ld   a,(ix+$06)
-2122: 32 45 83    ld   ($8345),a
+2122: 32 45 83    ld   (scroll_speed_8345),a
 2125: AF          xor  a
 2126: 21 77 84    ld   hl,$8477
 2129: 77          ld   (hl),a
@@ -4217,7 +5140,7 @@ music_sequencer_0c00:
 2157: 23          inc  hl
 2158: 10 FC       djnz $2156
 215A: 0E 00       ld   c,$00
-215C: 21 5B 83    ld   hl,$835B
+215C: 21 5B 83    ld   hl,object_pos_835b
 215F: 71          ld   (hl),c
 2160: 23          inc  hl
 2161: DD 7E 00    ld   a,(ix+$00)
@@ -4287,32 +5210,37 @@ music_sequencer_0c00:
 21B4: 23          inc  hl
 21B5: 10 F8       djnz $21AF
 21B7: 3E 05       ld   a,$05
-21B9: CF          rst  $08
+21B9: CF          rst  $08                  ; SPAWN task $05 (task05_sprite_positions_13e2)
 21BA: 3E 05       ld   a,$05
-21BC: D7          rst  $10
+21BC: D7          rst  $10                  ; KILL task $05 (task05_sprite_positions_13e2)
 21BD: 06 F0       ld   b,$F0
-21BF: CD D8 02    call $02D8
+21BF: CD D8 02    call vec_set_video_enable_02d8
 21C2: 3E 01       ld   a,$01
-21C4: F7          rst  $30
+21C4: F7          rst  $30                  ; SLEEP 1 frame (yield)
 21C5: 3E 2C       ld   a,$2C
-21C7: CF          rst  $08
+21C7: CF          rst  $08                  ; SPAWN task $2C (task2c_s2_drift_21da)
 21C8: 3E 21       ld   a,$21
-21CA: CF          rst  $08
+21CA: CF          rst  $08                  ; SPAWN task $21 (task21_s2_player_control_22c8)
 21CB: 3E 25       ld   a,$25
-21CD: CF          rst  $08
+21CD: CF          rst  $08                  ; SPAWN task $25 (task25_s2_world_update_27f9)
 21CE: 3E 04       ld   a,$04
-21D0: CF          rst  $08
+21D0: CF          rst  $08                  ; SPAWN task $04 (task04_scroll_117c)
 21D1: 3E 05       ld   a,$05
-21D3: CF          rst  $08
+21D3: CF          rst  $08                  ; SPAWN task $05 (task05_sprite_positions_13e2)
 21D4: 3E 2E       ld   a,$2E
-21D6: CF          rst  $08
+21D6: CF          rst  $08                  ; SPAWN task $2E (task2e_s2_objects_2b7b)
 21D7: 3E 20       ld   a,$20
-21D9: D7          rst  $10
+21D9: D7          rst  $10                  ; KILL task $20 (task20_s2_init_2042)
+
+;----------------------------------------------------------------------------
+; === TASK $2C : horizontal default: speed back to normal, player drifts back ===
+;----------------------------------------------------------------------------
+task2c_s2_drift_21da:
 21DA: 3E 01       ld   a,$01
-21DC: F7          rst  $30
+21DC: F7          rst  $30                  ; SLEEP 1 frame (yield)
 21DD: 21 64 84    ld   hl,$8464
 21E0: DD 21 67 84 ld   ix,$8467
-21E4: 11 45 83    ld   de,$8345
+21E4: 11 45 83    ld   de,scroll_speed_8345
 21E7: 36 00       ld   (hl),$00
 21E9: 7E          ld   a,(hl)
 21EA: 3C          inc  a
@@ -4336,7 +5264,7 @@ music_sequencer_0c00:
 220C: 18 03       jr   $2211
 220E: DD 7E 05    ld   a,(ix+$05)
 2211: 47          ld   b,a
-2212: CD DE 02    call $02DE
+2212: CD DE 02    call vec_scroll_speed_lookup_02de
 2215: 81          add  a,c
 2216: 32 5C 83    ld   ($835C),a
 2219: C6 10       add  a,$10
@@ -4349,13 +5277,18 @@ music_sequencer_0c00:
 2227: 90          sub  b
 2228: 32 54 84    ld   ($8454),a
 222B: 3E 01       ld   a,$01
-222D: F7          rst  $30
+222D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 222E: 18 B9       jr   $21E9
+
+;----------------------------------------------------------------------------
+; === TASK $2A : swim faster (speed up to max, x forward) ===
+;----------------------------------------------------------------------------
+task2a_s2_swim_forward_2230:
 2230: 3E 01       ld   a,$01
-2232: F7          rst  $30
+2232: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2233: 21 64 84    ld   hl,$8464
 2236: DD 21 67 84 ld   ix,$8467
-223A: 11 45 83    ld   de,$8345
+223A: 11 45 83    ld   de,scroll_speed_8345
 223D: 36 00       ld   (hl),$00
 223F: 7E          ld   a,(hl)
 2240: 3C          inc  a
@@ -4375,7 +5308,7 @@ music_sequencer_0c00:
 2259: 28 16       jr   z,$2271
 225B: 38 14       jr   c,$2271
 225D: DD 7E 03    ld   a,(ix+$03)
-2260: CD DE 02    call $02DE
+2260: CD DE 02    call vec_scroll_speed_lookup_02de
 2263: 81          add  a,c
 2264: 32 5C 83    ld   ($835C),a
 2267: C6 10       add  a,$10
@@ -4388,12 +5321,17 @@ music_sequencer_0c00:
 2275: 90          sub  b
 2276: 32 54 84    ld   ($8454),a
 2279: 3E 01       ld   a,$01
-227B: F7          rst  $30
+227B: F7          rst  $30                  ; SLEEP 1 frame (yield)
 227C: 18 C1       jr   $223F
+
+;----------------------------------------------------------------------------
+; === TASK $2B : swim slower ===
+;----------------------------------------------------------------------------
+task2b_s2_swim_back_227e:
 227E: 3E 01       ld   a,$01
-2280: F7          rst  $30
+2280: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2281: 21 64 84    ld   hl,$8464
-2284: 11 45 83    ld   de,$8345
+2284: 11 45 83    ld   de,scroll_speed_8345
 2287: DD 21 67 84 ld   ix,$8467
 228B: 36 00       ld   (hl),$00
 228D: 7E          ld   a,(hl)
@@ -4412,7 +5350,7 @@ music_sequencer_0c00:
 22A2: DD BE 00    cp   (ix+$00)
 22A5: 28 14       jr   z,$22BB
 22A7: DD 7E 04    ld   a,(ix+$04)
-22AA: CD DE 02    call $02DE
+22AA: CD DE 02    call vec_scroll_speed_lookup_02de
 22AD: 81          add  a,c
 22AE: 32 5C 83    ld   ($835C),a
 22B1: C6 10       add  a,$10
@@ -4425,26 +5363,36 @@ music_sequencer_0c00:
 22BF: 90          sub  b
 22C0: 32 54 84    ld   ($8454),a
 22C3: 3E 01       ld   a,$01
-22C5: F7          rst  $30
+22C5: F7          rst  $30                  ; SLEEP 1 frame (yield)
 22C6: 18 C5       jr   $228D
+
+;----------------------------------------------------------------------------
+; === TASK $21 : STAGE 2 PLAYER CONTROL ===
+; Button -> knife ($24 at the surface / $1C under water), under the surface
+; -> air meter $22, joystick -> vertical task ($1E dive / $1F rise / $2D
+; none, current ID in $8452) and horizontal task ($2A / $2B / $2C, current
+; ID in $8453): the old one is killed and the new one spawned.
+; Checks the river end (bank) -> stage clear.
+;----------------------------------------------------------------------------
+task21_s2_player_control_22c8:
 22C8: 3E 01       ld   a,$01
-22CA: F7          rst  $30
+22CA: F7          rst  $30                  ; SLEEP 1 frame (yield)
 22CB: DD 21 67 84 ld   ix,$8467
 22CF: 21 50 84    ld   hl,$8450
 22D2: 46          ld   b,(hl)
-22D3: 3A D8 81    ld   a,($81D8)
+22D3: 3A D8 81    ld   a,(joystick_input_81d8)
 22D6: 77          ld   (hl),a
 22D7: 4F          ld   c,a
-22D8: CB 60       bit  4,b
+22D8: CB 60       bit  4,b                  ; button: pressed now and released last frame ?
 22DA: 28 12       jr   z,$22EE
 22DC: CB 61       bit  4,c
 22DE: 20 0E       jr   nz,$22EE
-22E0: 3A 5C 83    ld   a,($835C)
+22E0: 3A 5C 83    ld   a,($835C)            ; player x
 22E3: DD BE 01    cp   (ix+$01)
 22E6: 38 06       jr   c,$22EE
 22E8: 3E 24       ld   a,$24
-22EA: CF          rst  $08
-22EB: C3 BF 23    jp   $23BF
+22EA: CF          rst  $08                  ; SPAWN task $24 (task24_s2_knife_stab_2587)
+22EB: C3 BF 23    jp   s2_check_river_end_23bf
 22EE: 23          inc  hl
 22EF: 3A 5E 83    ld   a,($835E)
 22F2: C6 08       add  a,$08
@@ -4454,13 +5402,13 @@ music_sequencer_0c00:
 22FA: BE          cp   (hl)
 22FB: 20 09       jr   nz,$2306
 22FD: 3E 22       ld   a,$22
-22FF: CF          rst  $08
+22FF: CF          rst  $08                  ; SPAWN task $22 (task22_s2_air_meter_26cd)
 2300: 3E FF       ld   a,$FF
 2302: 18 01       jr   $2305
 2304: AF          xor  a
 2305: 77          ld   (hl),a
 2306: 23          inc  hl
-2307: CB 51       bit  2,c
+2307: CB 51       bit  2,c                  ; joystick bit 2 (down) -> task $1E
 2309: 20 0E       jr   nz,$2319
 230B: 3E 1E       ld   a,$1E
 230D: BE          cp   (hl)
@@ -4469,11 +5417,11 @@ music_sequencer_0c00:
 2311: 77          ld   (hl),a
 2312: 4F          ld   c,a
 2313: 78          ld   a,b
-2314: D7          rst  $10
+2314: D7          rst  $10                  ; KILL task A - kill old vertical task
 2315: 79          ld   a,c
-2316: CF          rst  $08
+2316: CF          rst  $08                  ; SPAWN task A - spawn new vertical task
 2317: 18 1E       jr   $2337
-2319: CB 59       bit  3,c
+2319: CB 59       bit  3,c                  ; joystick bit 3 (up) -> task $1F
 231B: 20 0E       jr   nz,$232B
 231D: 3E 1F       ld   a,$1F
 231F: BE          cp   (hl)
@@ -4482,25 +5430,25 @@ music_sequencer_0c00:
 2323: 77          ld   (hl),a
 2324: 4F          ld   c,a
 2325: 78          ld   a,b
-2326: D7          rst  $10
+2326: D7          rst  $10                  ; KILL task A
 2327: 79          ld   a,c
-2328: CF          rst  $08
+2328: CF          rst  $08                  ; SPAWN task A
 2329: 18 0C       jr   $2337
-232B: 3E 2D       ld   a,$2D
+232B: 3E 2D       ld   a,$2D                ; no vertical input -> task $2D (idle)
 232D: BE          cp   (hl)
 232E: 28 07       jr   z,$2337
 2330: 46          ld   b,(hl)
 2331: 77          ld   (hl),a
 2332: 4F          ld   c,a
 2333: 78          ld   a,b
-2334: D7          rst  $10
+2334: D7          rst  $10                  ; KILL task A
 2335: 79          ld   a,c
-2336: CF          rst  $08
+2336: CF          rst  $08                  ; SPAWN task A
 2337: 23          inc  hl
 2338: 3A 5C 83    ld   a,($835C)
 233B: DD BE 01    cp   (ix+$01)
 233E: 38 24       jr   c,$2364
-2340: CB 49       bit  1,c
+2340: CB 49       bit  1,c                  ; joystick bit 1 -> task $2B
 2342: 20 0E       jr   nz,$2352
 2344: 3E 2B       ld   a,$2B
 2346: BE          cp   (hl)
@@ -4509,11 +5457,11 @@ music_sequencer_0c00:
 234A: 77          ld   (hl),a
 234B: 4F          ld   c,a
 234C: 78          ld   a,b
-234D: D7          rst  $10
+234D: D7          rst  $10                  ; KILL task A
 234E: 79          ld   a,c
-234F: CF          rst  $08
+234F: CF          rst  $08                  ; SPAWN task A
 2350: 18 1E       jr   $2370
-2352: CB 41       bit  0,c
+2352: CB 41       bit  0,c                  ; joystick bit 0 -> task $2A
 2354: 20 0E       jr   nz,$2364
 2356: 3E 2A       ld   a,$2A
 2358: BE          cp   (hl)
@@ -4522,20 +5470,20 @@ music_sequencer_0c00:
 235C: 77          ld   (hl),a
 235D: 4F          ld   c,a
 235E: 78          ld   a,b
-235F: D7          rst  $10
+235F: D7          rst  $10                  ; KILL task A
 2360: 79          ld   a,c
-2361: CF          rst  $08
+2361: CF          rst  $08                  ; SPAWN task A
 2362: 18 0C       jr   $2370
-2364: 3E 2C       ld   a,$2C
+2364: 3E 2C       ld   a,$2C                ; default -> task $2C
 2366: BE          cp   (hl)
 2367: 28 07       jr   z,$2370
 2369: 46          ld   b,(hl)
 236A: 77          ld   (hl),a
 236B: 4F          ld   c,a
 236C: 78          ld   a,b
-236D: D7          rst  $10
+236D: D7          rst  $10                  ; KILL task A
 236E: 79          ld   a,c
-236F: CF          rst  $08
+236F: CF          rst  $08                  ; SPAWN task A
 2370: 23          inc  hl
 2371: 46          ld   b,(hl)
 2372: 23          inc  hl
@@ -4555,7 +5503,7 @@ music_sequencer_0c00:
 2385: A7          and  a
 2386: 28 05       jr   z,$238D
 2388: 3E 92       ld   a,$92
-238A: 32 0B D5    ld   ($D50B),a
+238A: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $92
 238D: 08          ex   af,af'
 238E: 77          ld   (hl),a
 238F: 57          ld   d,a
@@ -4587,11 +5535,13 @@ music_sequencer_0c00:
 23BA: 09          add  hl,bc
 23BB: 7E          ld   a,(hl)
 23BC: 32 C6 83    ld   ($83C6),a
+
+s2_check_river_end_23bf:
 23BF: 3E 01       ld   a,$01
-23C1: F7          rst  $30
+23C1: F7          rst  $30                  ; SLEEP 1 frame (yield)
 23C2: 3A 5C 83    ld   a,($835C)
 23C5: 47          ld   b,a
-23C6: 3A FB 82    ld   a,($82FB)
+23C6: 3A FB 82    ld   a,(scroll_l2_x_82fb)
 23C9: C6 04       add  a,$04
 23CB: 80          add  a,b
 23CC: E6 F8       and  $F8
@@ -4605,19 +5555,19 @@ music_sequencer_0c00:
 23D8: 6F          ld   l,a
 23D9: 7E          ld   a,(hl)
 23DA: A7          and  a
-23DB: 20 40       jr   nz,$241D
-23DD: 3A 5B 83    ld   a,($835B)
+23DB: 20 40       jr   nz,s2_reached_bank_241d
+23DD: 3A 5B 83    ld   a,(object_pos_835b)
 23E0: E6 F0       and  $F0
 23E2: CA CB 22    jp   z,$22CB
 23E5: CB 7F       bit  7,a
 23E7: 28 03       jr   z,$23EC
 23E9: 3E 21       ld   a,$21
-23EB: D7          rst  $10
+23EB: D7          rst  $10                  ; KILL task $21 (task21_s2_player_control_22c8)
 23EC: E6 30       and  $30
-23EE: C2 BF 23    jp   nz,$23BF
+23EE: C2 BF 23    jp   nz,s2_check_river_end_23bf
 23F1: DD 7E 06    ld   a,(ix+$06)
-23F4: 32 45 83    ld   ($8345),a
-23F7: 3A D8 81    ld   a,($81D8)
+23F4: 32 45 83    ld   (scroll_speed_8345),a
+23F7: 3A D8 81    ld   a,(joystick_input_81d8)
 23FA: 21 50 84    ld   hl,$8450
 23FD: 46          ld   b,(hl)
 23FE: 77          ld   (hl),a
@@ -4628,28 +5578,30 @@ music_sequencer_0c00:
 2407: 3A 5C 83    ld   a,($835C)
 240A: DD BE 01    cp   (ix+$01)
 240D: 38 0B       jr   c,$241A
-240F: 3A 5B 83    ld   a,($835B)
+240F: 3A 5B 83    ld   a,(object_pos_835b)
 2412: F6 10       or   $10
-2414: 32 5B 83    ld   ($835B),a
+2414: 32 5B 83    ld   (object_pos_835b),a
 2417: 3E 1C       ld   a,$1C
-2419: CF          rst  $08
-241A: C3 BF 23    jp   $23BF
+2419: CF          rst  $08                  ; SPAWN task $1C (task1c_s2_delayed_stab_2571)
+241A: C3 BF 23    jp   s2_check_river_end_23bf
+
+s2_reached_bank_241d:
 241D: 3E 04       ld   a,$04
-241F: D7          rst  $10
+241F: D7          rst  $10                  ; KILL task $04 (task04_scroll_117c)
 2420: 3E 1C       ld   a,$1C
-2422: D7          rst  $10
+2422: D7          rst  $10                  ; KILL task $1C (task1c_s2_delayed_stab_2571)
 2423: 3E 1D       ld   a,$1D
-2425: D7          rst  $10
+2425: D7          rst  $10                  ; KILL task $1D (task1d_s2_stab_hit_check_25f8)
 2426: 3E 24       ld   a,$24
-2428: D7          rst  $10
+2428: D7          rst  $10                  ; KILL task $24 (task24_s2_knife_stab_2587)
 2429: 3E 25       ld   a,$25
-242B: D7          rst  $10
+242B: D7          rst  $10                  ; KILL task $25 (task25_s2_world_update_27f9)
 242C: 21 52 84    ld   hl,$8452
 242F: 7E          ld   a,(hl)
-2430: D7          rst  $10
+2430: D7          rst  $10                  ; KILL task A
 2431: 23          inc  hl
 2432: 7E          ld   a,(hl)
-2433: D7          rst  $10
+2433: D7          rst  $10                  ; KILL task A
 2434: 21 70 5E    ld   hl,$5E70
 2437: 7E          ld   a,(hl)
 2438: 32 BE 83    ld   ($83BE),a
@@ -4664,32 +5616,32 @@ music_sequencer_0c00:
 244D: 3A 62 83    ld   a,($8362)
 2450: 32 5E 83    ld   ($835E),a
 2453: 3E 02       ld   a,$02
-2455: 32 5B 83    ld   ($835B),a
+2455: 32 5B 83    ld   (object_pos_835b),a
 2458: 3E AA       ld   a,$AA
-245A: 32 0B D5    ld   ($D50B),a
+245A: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AA
 245D: 3E 80       ld   a,$80
-245F: 32 3B 84    ld   ($843B),a
+245F: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 2462: 3E 1F       ld   a,$1F
-2464: CF          rst  $08
+2464: CF          rst  $08                  ; SPAWN task $1F (task1f_s2_rise_2542)
 2465: 3E 01       ld   a,$01
-2467: F7          rst  $30
+2467: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2468: 3A 5E 83    ld   a,($835E)
 246B: DD BE 0C    cp   (ix+$0c)
 246E: 38 F5       jr   c,$2465
 2470: AF          xor  a
 2471: 32 51 84    ld   ($8451),a
 2474: 3E 01       ld   a,$01
-2476: F7          rst  $30
+2476: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2477: 3E 1F       ld   a,$1F
-2479: D7          rst  $10
+2479: D7          rst  $10                  ; KILL task $1F (task1f_s2_rise_2542)
 247A: 3E 22       ld   a,$22
-247C: D7          rst  $10
+247C: D7          rst  $10                  ; KILL task $22 (task22_s2_air_meter_26cd)
 247D: 3E 04       ld   a,$04
-247F: F7          rst  $30
+247F: F7          rst  $30                  ; SLEEP 4 frames (yield)
 2480: 3E 94       ld   a,$94
-2482: 32 0B D5    ld   ($D50B),a
+2482: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $94
 2485: DD 21 C2 84 ld   ix,$84C2
-2489: FD 21 5B 83 ld   iy,$835B
+2489: FD 21 5B 83 ld   iy,object_pos_835b
 248D: 21 C0 5F    ld   hl,$5FC0
 2490: DD 74 00    ld   (ix+$00),h
 2493: DD 75 12    ld   (ix+$12),l
@@ -4697,7 +5649,7 @@ music_sequencer_0c00:
 2497: 23          inc  hl
 2498: 7E          ld   a,(hl)
 2499: DD 77 24    ld   (ix+$24),a
-249C: CD D8 2A    call $2AD8
+249C: CD D8 2A    call object_path_step_2ad8
 249F: FE 02       cp   $02
 24A1: 20 2A       jr   nz,$24CD
 24A3: 01 10 00    ld   bc,$0010
@@ -4720,7 +5672,7 @@ music_sequencer_0c00:
 24C4: 7E          ld   a,(hl)
 24C5: FD 77 67    ld   (iy+$67),a
 24C8: 3E 02       ld   a,$02
-24CA: F7          rst  $30
+24CA: F7          rst  $30                  ; SLEEP 2 frames (yield)
 24CB: 18 CF       jr   $249C
 24CD: 01 10 00    ld   bc,$0010
 24D0: 09          add  hl,bc
@@ -4736,40 +5688,45 @@ music_sequencer_0c00:
 24E6: FD 77 67    ld   (iy+$67),a
 24E9: 3E 32       ld   a,$32
 24EB: 47          ld   b,a
-24EC: 3A 74 81    ld   a,($8174)
+24EC: 3A 74 81    ld   a,(pending_score_ticks_8174)
 24EF: 80          add  a,b
-24F0: 32 74 81    ld   ($8174),a
+24F0: 32 74 81    ld   (pending_score_ticks_8174),a
 24F3: 3E B4       ld   a,$B4
-24F5: F7          rst  $30
+24F5: F7          rst  $30                  ; SLEEP 180 frames (yield)
 24F6: 3E FF       ld   a,$FF
-24F8: 21 58 84    ld   hl,$8458
+24F8: 21 58 84    ld   hl,status_line_8458
 24FB: 06 0A       ld   b,$0A
 24FD: 77          ld   (hl),a
 24FE: 2B          dec  hl
 24FF: 10 FC       djnz $24FD
 2501: 3E 01       ld   a,$01
-2503: F7          rst  $30
+2503: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2504: 3E FF       ld   a,$FF
-2506: 32 5A 83    ld   ($835A),a
+2506: 32 5A 83    ld   (scroll_mode_835a),a
 2509: 3E 00       ld   a,$00
-250B: 32 34 84    ld   ($8434),a
+250B: 32 34 84    ld   (player_died_8434),a
 250E: 3E 00       ld   a,$00
-2510: EF          rst  $28
-2511: D9          exx
+2510: EF          rst  $28                  ; SIGNAL event $00 - event 0 : stage finished
+2511: D9          exx                       ; generic 'kill myself'
 2512: 79          ld   a,c
 2513: D9          exx
-2514: D7          rst  $10
+2514: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
 2515: 3E 21       ld   a,$21
-2517: D7          rst  $10
+2517: D7          rst  $10                  ; KILL task $21 (task21_s2_player_control_22c8)
+
+;----------------------------------------------------------------------------
+; === TASK $1E : dive (y towards bottom limit) ===
+;----------------------------------------------------------------------------
+task1e_s2_dive_2518:
 2518: 3E 01       ld   a,$01
-251A: F7          rst  $30
+251A: F7          rst  $30                  ; SLEEP 1 frame (yield)
 251B: DD 21 67 84 ld   ix,$8467
 251F: 3A 62 83    ld   a,($8362)
 2522: DD BE 0D    cp   (ix+$0d)
 2525: 38 16       jr   c,$253D
 2527: 47          ld   b,a
 2528: DD 7E 0F    ld   a,(ix+$0f)
-252B: CD DE 02    call $02DE
+252B: CD DE 02    call vec_scroll_speed_lookup_02de
 252E: 4F          ld   c,a
 252F: 80          add  a,b
 2530: 32 62 83    ld   ($8362),a
@@ -4778,17 +5735,22 @@ music_sequencer_0c00:
 2539: 81          add  a,c
 253A: 32 5E 83    ld   ($835E),a
 253D: 3E 01       ld   a,$01
-253F: F7          rst  $30
+253F: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2540: 18 DD       jr   $251F
+
+;----------------------------------------------------------------------------
+; === TASK $1F : rise (y towards the surface) ===
+;----------------------------------------------------------------------------
+task1f_s2_rise_2542:
 2542: 3E 01       ld   a,$01
-2544: F7          rst  $30
+2544: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2545: DD 21 67 84 ld   ix,$8467
 2549: 3A 62 83    ld   a,($8362)
 254C: DD BE 0C    cp   (ix+$0c)
 254F: 30 16       jr   nc,$2567
 2551: 47          ld   b,a
 2552: DD 7E 0E    ld   a,(ix+$0e)
-2555: CD DE 02    call $02DE
+2555: CD DE 02    call vec_scroll_speed_lookup_02de
 2558: 4F          ld   c,a
 2559: 80          add  a,b
 255A: 32 62 83    ld   ($8362),a
@@ -4797,30 +5759,45 @@ music_sequencer_0c00:
 2563: 81          add  a,c
 2564: 32 5E 83    ld   ($835E),a
 2567: 3E 01       ld   a,$01
-2569: F7          rst  $30
+2569: F7          rst  $30                  ; SLEEP 1 frame (yield)
 256A: 18 DD       jr   $2549
+
+;----------------------------------------------------------------------------
+; === TASK $2D : idle (does nothing) ===
+;----------------------------------------------------------------------------
+task2d_s2_idle_256c:
 256C: 3E 01       ld   a,$01
-256E: F7          rst  $30
-256F: 18 FB       jr   $256C
+256E: F7          rst  $30                  ; SLEEP 1 frame (yield)
+256F: 18 FB       jr   task2d_s2_idle_256c
+
+;----------------------------------------------------------------------------
+; === TASK $1C : knife under water: waits 16 frames (dies if the player died) then continues as $24 ===
+;----------------------------------------------------------------------------
+task1c_s2_delayed_stab_2571:
 2571: 3E 01       ld   a,$01
-2573: F7          rst  $30
+2573: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2574: 06 10       ld   b,$10
 2576: 18 03       jr   $257B
 2578: 3E 01       ld   a,$01
-257A: F7          rst  $30
-257B: 3A 5B 83    ld   a,($835B)
+257A: F7          rst  $30                  ; SLEEP 1 frame (yield)
+257B: 3A 5B 83    ld   a,(object_pos_835b)
 257E: E6 80       and  $80
 2580: 28 03       jr   z,$2585
 2582: 3E 1C       ld   a,$1C
-2584: D7          rst  $10
+2584: D7          rst  $10                  ; KILL task $1C (task1c_s2_delayed_stab_2571)
 2585: 10 F1       djnz $2578
+
+;----------------------------------------------------------------------------
+; === TASK $24 : knife stab animation (sound $93), spawns $1D during the stab ===
+;----------------------------------------------------------------------------
+task24_s2_knife_stab_2587:
 2587: 3E 01       ld   a,$01
-2589: F7          rst  $30
+2589: F7          rst  $30                  ; SLEEP 1 frame (yield)
 258A: 3E 93       ld   a,$93
-258C: 32 0B D5    ld   ($D50B),a
-258F: 3A 5B 83    ld   a,($835B)
+258C: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $93
+258F: 3A 5B 83    ld   a,(object_pos_835b)
 2592: F6 20       or   $20
-2594: 32 5B 83    ld   ($835B),a
+2594: 32 5B 83    ld   (object_pos_835b),a
 2597: 3A 5E 83    ld   a,($835E)
 259A: C6 08       add  a,$08
 259C: 32 5E 83    ld   ($835E),a
@@ -4838,9 +5815,9 @@ music_sequencer_0c00:
 25B9: 1A          ld   a,(de)
 25BA: 32 C2 83    ld   ($83C2),a
 25BD: 3E 1D       ld   a,$1D
-25BF: CF          rst  $08
+25BF: CF          rst  $08                  ; SPAWN task $1D (task1d_s2_stab_hit_check_25f8)
 25C0: 3E 08       ld   a,$08
-25C2: F7          rst  $30
+25C2: F7          rst  $30                  ; SLEEP 8 frames (yield)
 25C3: 13          inc  de
 25C4: 1A          ld   a,(de)
 25C5: 32 BE 83    ld   ($83BE),a
@@ -4848,9 +5825,9 @@ music_sequencer_0c00:
 25C9: 1A          ld   a,(de)
 25CA: 32 C2 83    ld   ($83C2),a
 25CD: 3E 08       ld   a,$08
-25CF: F7          rst  $30
+25CF: F7          rst  $30                  ; SLEEP 8 frames (yield)
 25D0: 3E 1D       ld   a,$1D
-25D2: D7          rst  $10
+25D2: D7          rst  $10                  ; KILL task $1D (task1d_s2_stab_hit_check_25f8)
 25D3: 3A 62 83    ld   a,($8362)
 25D6: 32 5E 83    ld   ($835E),a
 25D9: 3A 70 5E    ld   a,($5E70)
@@ -4862,31 +5839,36 @@ music_sequencer_0c00:
 25E9: 77          ld   (hl),a
 25EA: 23          inc  hl
 25EB: 77          ld   (hl),a
-25EC: 3A 5B 83    ld   a,($835B)
+25EC: 3A 5B 83    ld   a,(object_pos_835b)
 25EF: E6 CF       and  $CF
-25F1: 32 5B 83    ld   ($835B),a
+25F1: 32 5B 83    ld   (object_pos_835b),a
 25F4: D9          exx
 25F5: 79          ld   a,c
 25F6: D9          exx
-25F7: D7          rst  $10
+25F7: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
+
+;----------------------------------------------------------------------------
+; === TASK $1D : knife hit test vs the 6 crocodiles, points with combo counter ===
+;----------------------------------------------------------------------------
+task1d_s2_stab_hit_check_25f8:
 25F8: 3E 01       ld   a,$01
-25FA: F7          rst  $30
+25FA: F7          rst  $30                  ; SLEEP 1 frame (yield)
 25FB: 3A 5C 83    ld   a,($835C)
 25FE: 67          ld   h,a
 25FF: 3A 5E 83    ld   a,($835E)
 2602: 6F          ld   l,a
-2603: 3A 5B 83    ld   a,($835B)
+2603: 3A 5B 83    ld   a,(object_pos_835b)
 2606: E6 A0       and  $A0
 2608: FE 20       cp   $20
 260A: 28 0D       jr   z,$2619
 260C: E6 80       and  $80
 260E: 28 06       jr   z,$2616
 2610: 3E 1C       ld   a,$1C
-2612: D7          rst  $10
+2612: D7          rst  $10                  ; KILL task $1C (task1c_s2_delayed_stab_2571)
 2613: 3E 24       ld   a,$24
-2615: D7          rst  $10
+2615: D7          rst  $10                  ; KILL task $24 (task24_s2_knife_stab_2587)
 2616: 3E 1D       ld   a,$1D
-2618: D7          rst  $10
+2618: D7          rst  $10                  ; KILL task $1D (task1d_s2_stab_hit_check_25f8)
 2619: FD 21 67 83 ld   iy,$8367
 261D: DD 21 B1 84 ld   ix,$84B1
 2621: 06 06       ld   b,$06
@@ -4917,7 +5899,7 @@ music_sequencer_0c00:
 265F: FD 86 02    add  a,(iy+$02)
 2662: FD 77 02    ld   (iy+$02),a
 2665: 3E A6       ld   a,$A6
-2667: 32 0B D5    ld   ($D50B),a
+2667: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A6
 266A: DD 56 6C    ld   d,(ix+$6c)
 266D: CB 7A       bit  7,d
 266F: 28 10       jr   z,$2681
@@ -4961,18 +5943,23 @@ music_sequencer_0c00:
 26B4: 1A          ld   a,(de)
 26B5: 50          ld   d,b
 26B6: 47          ld   b,a
-26B7: 3A 74 81    ld   a,($8174)
+26B7: 3A 74 81    ld   a,(pending_score_ticks_8174)
 26BA: 80          add  a,b
-26BB: 32 74 81    ld   ($8174),a
+26BB: 32 74 81    ld   (pending_score_ticks_8174),a
 26BE: 42          ld   b,d
 26BF: 11 08 00    ld   de,$0008
 26C2: FD 19       add  iy,de
 26C4: DD 23       inc  ix
 26C6: 05          dec  b
 26C7: C2 23 26    jp   nz,$2623
-26CA: C3 F8 25    jp   $25F8
+26CA: C3 F8 25    jp   task1d_s2_stab_hit_check_25f8
+
+;----------------------------------------------------------------------------
+; === TASK $22 : AIR METER (under water). Refill when surfacing, drowns (task $23) when empty ===
+;----------------------------------------------------------------------------
+task22_s2_air_meter_26cd:
 26CD: 3E 01       ld   a,$01
-26CF: F7          rst  $30
+26CF: F7          rst  $30                  ; SLEEP 1 frame (yield)
 26D0: 3E 30       ld   a,$30
 26D2: 32 57 84    ld   ($8457),a
 26D5: 11 57 84    ld   de,$8457
@@ -4980,7 +5967,7 @@ music_sequencer_0c00:
 26DB: 3A 65 84    ld   a,($8465)
 26DE: 47          ld   b,a
 26DF: 3E 01       ld   a,$01
-26E1: F7          rst  $30
+26E1: F7          rst  $30                  ; SLEEP 1 frame (yield)
 26E2: 7E          ld   a,(hl)
 26E3: A7          and  a
 26E4: 28 49       jr   z,$272F
@@ -4994,7 +5981,7 @@ music_sequencer_0c00:
 26F2: B8          cp   b
 26F3: 20 05       jr   nz,$26FA
 26F5: 3E 83       ld   a,$83
-26F7: 32 0B D5    ld   ($D50B),a
+26F7: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $83
 26FA: 78          ld   a,b
 26FB: 12          ld   (de),a
 26FC: 13          inc  de
@@ -5033,7 +6020,7 @@ music_sequencer_0c00:
 272B: 20 FB       jr   nz,$2728
 272D: 18 A6       jr   $26D5
 272F: 3E 91       ld   a,$91
-2731: 32 0B D5    ld   ($D50B),a
+2731: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $91
 2734: 21 07 00    ld   hl,$0007
 2737: 19          add  hl,de
 2738: 06 06       ld   b,$06
@@ -5042,20 +6029,25 @@ music_sequencer_0c00:
 273D: 23          inc  hl
 273E: 10 FC       djnz $273C
 2740: 3E 22       ld   a,$22
-2742: D7          rst  $10
+2742: D7          rst  $10                  ; KILL task $22 (task22_s2_air_meter_26cd)
 2743: 3E A9       ld   a,$A9
-2745: 32 0B D5    ld   ($D50B),a
+2745: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A9
 2748: 3E 23       ld   a,$23
-274A: CF          rst  $08
+274A: CF          rst  $08                  ; SPAWN task $23 (task23_s2_death_274e)
 274B: 3E 22       ld   a,$22
-274D: D7          rst  $10
+274D: D7          rst  $10                  ; KILL task $22 (task22_s2_air_meter_26cd)
+
+;----------------------------------------------------------------------------
+; === TASK $23 : STAGE 2 DEATH: saves checkpoint, death animation, $8434=$FF, event 0 ===
+;----------------------------------------------------------------------------
+task23_s2_death_274e:
 274E: 3E 80       ld   a,$80
-2750: 32 5B 83    ld   ($835B),a
+2750: 32 5B 83    ld   (object_pos_835b),a
 2753: 3E 04       ld   a,$04
-2755: F7          rst  $30
+2755: F7          rst  $30                  ; SLEEP 4 frames (yield)
 2756: 3E 25       ld   a,$25
-2758: D7          rst  $10
-2759: 21 56 83    ld   hl,$8356
+2758: D7          rst  $10                  ; KILL task $25 (task25_s2_world_update_27f9)
+2759: 21 56 83    ld   hl,distance_hi_8356
 275C: 46          ld   b,(hl)
 275D: 23          inc  hl
 275E: 56          ld   d,(hl)
@@ -5064,7 +6056,7 @@ music_sequencer_0c00:
 2761: 23          inc  hl
 2762: 5E          ld   e,(hl)
 2763: 21 E1 81    ld   hl,$81E1
-2766: 3A 56 81    ld   a,($8156)
+2766: 3A 56 81    ld   a,(cur_player_8156)
 2769: A7          and  a
 276A: 20 03       jr   nz,$276F
 276C: 21 E5 81    ld   hl,$81E5
@@ -5076,21 +6068,21 @@ music_sequencer_0c00:
 2774: 23          inc  hl
 2775: 73          ld   (hl),e
 2776: 3E 21       ld   a,$21
-2778: D7          rst  $10
+2778: D7          rst  $10                  ; KILL task $21 (task21_s2_player_control_22c8)
 2779: 3E 22       ld   a,$22
-277B: D7          rst  $10
+277B: D7          rst  $10                  ; KILL task $22 (task22_s2_air_meter_26cd)
 277C: 3E 24       ld   a,$24
-277E: D7          rst  $10
+277E: D7          rst  $10                  ; KILL task $24 (task24_s2_knife_stab_2587)
 277F: 3E 04       ld   a,$04
-2781: D7          rst  $10
+2781: D7          rst  $10                  ; KILL task $04 (task04_scroll_117c)
 2782: 21 52 84    ld   hl,$8452
 2785: 7E          ld   a,(hl)
-2786: D7          rst  $10
+2786: D7          rst  $10                  ; KILL task A
 2787: 23          inc  hl
 2788: 7E          ld   a,(hl)
-2789: D7          rst  $10
+2789: D7          rst  $10                  ; KILL task A
 278A: 3E 01       ld   a,$01
-278C: F7          rst  $30
+278C: F7          rst  $30                  ; SLEEP 1 frame (yield)
 278D: 3E 3F       ld   a,$3F
 278F: 32 C6 83    ld   ($83C6),a
 2792: 21 80 5E    ld   hl,$5E80
@@ -5104,23 +6096,23 @@ music_sequencer_0c00:
 27A4: 3E 02       ld   a,$02
 27A6: 32 75 84    ld   ($8475),a
 27A9: 3E 80       ld   a,$80
-27AB: 32 3B 84    ld   ($843B),a
+27AB: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 27AE: 3E 1F       ld   a,$1F
-27B0: CF          rst  $08
+27B0: CF          rst  $08                  ; SPAWN task $1F (task1f_s2_rise_2542)
 27B1: 3A 73 84    ld   a,($8473)
 27B4: 47          ld   b,a
 27B5: 3E 01       ld   a,$01
-27B7: F7          rst  $30
+27B7: F7          rst  $30                  ; SLEEP 1 frame (yield)
 27B8: 3A 5E 83    ld   a,($835E)
 27BB: B8          cp   b
 27BC: 38 F7       jr   c,$27B5
 27BE: 3E 1F       ld   a,$1F
-27C0: D7          rst  $10
+27C0: D7          rst  $10                  ; KILL task $1F (task1f_s2_rise_2542)
 27C1: 3E A8       ld   a,$A8
-27C3: 32 0B D5    ld   ($D50B),a
+27C3: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A8
 27C6: 06 11       ld   b,$11
 27C8: 3E 08       ld   a,$08
-27CA: F7          rst  $30
+27CA: F7          rst  $30                  ; SLEEP 8 frames (yield)
 27CB: 21 82 5E    ld   hl,$5E82
 27CE: 78          ld   a,b
 27CF: E6 01       and  $01
@@ -5136,21 +6128,28 @@ music_sequencer_0c00:
 27DD: 32 C2 83    ld   ($83C2),a
 27E0: 10 E6       djnz $27C8
 27E2: 3E 1E       ld   a,$1E
-27E4: F7          rst  $30
+27E4: F7          rst  $30                  ; SLEEP 30 frames (yield)
 27E5: 3E FF       ld   a,$FF
-27E7: 32 5A 83    ld   ($835A),a
+27E7: 32 5A 83    ld   (scroll_mode_835a),a
 27EA: 3E FF       ld   a,$FF
-27EC: 32 34 84    ld   ($8434),a
+27EC: 32 34 84    ld   (player_died_8434),a
 27EF: 3E 00       ld   a,$00
-27F1: EF          rst  $28
-27F2: D9          exx
+27F1: EF          rst  $28                  ; SIGNAL event $00 - event 0 : life lost
+27F2: D9          exx                       ; generic 'kill myself'
 27F3: 79          ld   a,c
 27F4: D9          exx
-27F5: D7          rst  $10
+27F5: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
 27F6: 3E 23       ld   a,$23
-27F8: D7          rst  $10
+27F8: D7          rst  $10                  ; KILL task $23 (task23_s2_death_274e)
+
+;----------------------------------------------------------------------------
+; === TASK $25 : STAGE 2 WORLD: water surface animation, player vs
+; crocodile collision (-> $23), objects scroll, object spawning from the
+; stage script ($847F) according to the distance.
+;----------------------------------------------------------------------------
+task25_s2_world_update_27f9:
 27F9: 3E 01       ld   a,$01
-27FB: F7          rst  $30
+27FB: F7          rst  $30                  ; SLEEP 1 frame (yield)
 27FC: 21 7B 84    ld   hl,$847B
 27FF: 7E          ld   a,(hl)
 2800: 3C          inc  a
@@ -5171,7 +6170,7 @@ music_sequencer_0c00:
 2816: CB 1B       rr   e
 2818: 57          ld   d,a
 2819: 19          add  hl,de
-281A: 11 37 84    ld   de,$8437
+281A: 11 37 84    ld   de,surface_anim_ptr_8437
 281D: EB          ex   de,hl
 281E: 72          ld   (hl),d
 281F: 23          inc  hl
@@ -5179,7 +6178,7 @@ music_sequencer_0c00:
 2821: 18 01       jr   $2824
 2823: 77          ld   (hl),a
 2824: D9          exx
-2825: 3A 48 83    ld   a,($8348)
+2825: 3A 48 83    ld   a,(layer_scroll_state_8348)
 2828: 67          ld   h,a
 2829: 11 08 00    ld   de,$0008
 282C: D9          exx
@@ -5219,11 +6218,11 @@ music_sequencer_0c00:
 2878: FE 18       cp   $18
 287A: 30 0B       jr   nc,$2887
 287C: 3E A7       ld   a,$A7
-287E: 32 0B D5    ld   ($D50B),a
+287E: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A7
 2881: 3E 23       ld   a,$23
-2883: CF          rst  $08
+2883: CF          rst  $08                  ; SPAWN task $23 (task23_s2_death_274e)
 2884: 3E 25       ld   a,$25
-2886: D7          rst  $10
+2886: D7          rst  $10                  ; KILL task $25 (task25_s2_world_update_27f9)
 2887: DD 23       inc  ix
 2889: D9          exx
 288A: FD 7E 01    ld   a,(iy+$01)
@@ -5294,12 +6293,12 @@ music_sequencer_0c00:
 290A: C5          push bc
 290B: DD E5       push ix
 290D: 3E BB       ld   a,$BB
-290F: 32 0B D5    ld   ($D50B),a
+290F: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $BB
 2912: DD 21 B9 84 ld   ix,$84B9
 2916: FD 21 9F 83 ld   iy,$839F
 291A: 26 06       ld   h,$06
 291C: 01 04 00    ld   bc,$0004
-291F: CD C6 2A    call $2AC6
+291F: CD C6 2A    call find_free_object_slot_2ac6
 2922: BC          cp   h
 2923: 28 36       jr   z,$295B
 2925: 26 00       ld   h,$00
@@ -5336,7 +6335,7 @@ music_sequencer_0c00:
 296C: 11 7F 84    ld   de,$847F
 296F: 21 7D 84    ld   hl,$847D
 2972: 06 00       ld   b,$00
-2974: 3A 48 83    ld   a,($8348)
+2974: 3A 48 83    ld   a,(layer_scroll_state_8348)
 2977: 86          add  a,(hl)
 2978: 30 01       jr   nc,$297B
 297A: 04          inc  b
@@ -5365,7 +6364,7 @@ music_sequencer_0c00:
 299D: FD 21 67 83 ld   iy,$8367
 29A1: 01 08 00    ld   bc,$0008
 29A4: 26 04       ld   h,$04
-29A6: CD C6 2A    call $2AC6
+29A6: CD C6 2A    call find_free_object_slot_2ac6
 29A9: BC          cp   h
 29AA: CA BB 2A    jp   z,$2ABB
 29AD: FD 36 02 00 ld   (iy+$02),$00
@@ -5404,14 +6403,14 @@ music_sequencer_0c00:
 29EA: 32 77 84    ld   ($8477),a
 29ED: DD 77 6C    ld   (ix+$6c),a
 29F0: 3E A4       ld   a,$A4
-29F2: 32 0B D5    ld   ($D50B),a
+29F2: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A4
 29F5: C3 BC 2A    jp   $2ABC
 29F8: 20 4E       jr   nz,$2A48
 29FA: DD 21 B5 84 ld   ix,$84B5
 29FE: FD 21 87 83 ld   iy,$8387
 2A02: 01 08 00    ld   bc,$0008
 2A05: 26 02       ld   h,$02
-2A07: CD C6 2A    call $2AC6
+2A07: CD C6 2A    call find_free_object_slot_2ac6
 2A0A: BC          cp   h
 2A0B: CA BB 2A    jp   z,$2ABB
 2A0E: AF          xor  a
@@ -5439,7 +6438,7 @@ music_sequencer_0c00:
 2A3A: DD 74 00    ld   (ix+$00),h
 2A3D: DD 77 12    ld   (ix+$12),a
 2A40: 3E A4       ld   a,$A4
-2A42: 32 0B D5    ld   ($D50B),a
+2A42: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A4
 2A45: C3 BC 2A    jp   $2ABC
 2A48: FE 04       cp   $04
 2A4A: 30 18       jr   nc,$2A64
@@ -5447,7 +6446,7 @@ music_sequencer_0c00:
 2A50: DD 21 B7 84 ld   ix,$84B7
 2A54: 01 04 00    ld   bc,$0004
 2A57: 26 02       ld   h,$02
-2A59: CD C6 2A    call $2AC6
+2A59: CD C6 2A    call find_free_object_slot_2ac6
 2A5C: BC          cp   h
 2A5D: CA BB 2A    jp   z,$2ABB
 2A60: 13          inc  de
@@ -5501,7 +6500,12 @@ music_sequencer_0c00:
 2AC0: 72          ld   (hl),d
 2AC1: 23          inc  hl
 2AC2: 73          ld   (hl),e
-2AC3: C3 F9 27    jp   $27F9
+2AC3: C3 F9 27    jp   task25_s2_world_update_27f9
+
+;----------------------------------------------------------------------------
+; Find a free object slot: IX = flags, IY = objects, BC = object size, H = count. out: A != H if found.
+;----------------------------------------------------------------------------
+find_free_object_slot_2ac6:
 2AC6: AF          xor  a
 2AC7: DD BE 00    cp   (ix+$00)
 2ACA: 20 04       jr   nz,$2AD0
@@ -5512,6 +6516,11 @@ music_sequencer_0c00:
 2AD4: 25          dec  h
 2AD5: 20 F0       jr   nz,$2AC7
 2AD7: C9          ret
+
+;----------------------------------------------------------------------------
+; Advance one object along its path script. out: A = 0 idle, 1 moved, 2 new segment, 3 path finished.
+;----------------------------------------------------------------------------
+object_path_step_2ad8:
 2AD8: DD 56 00    ld   d,(ix+$00)
 2ADB: AF          xor  a
 2ADC: 47          ld   b,a
@@ -5601,13 +6610,18 @@ music_sequencer_0c00:
 2B78: 7A          ld   a,d
 2B79: D1          pop  de
 2B7A: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $2E : STAGE 2 OBJECTS (crocodiles, other enemies) animation / AI ===
+;----------------------------------------------------------------------------
+task2e_s2_objects_2b7b:
 2B7B: 3E 01       ld   a,$01
-2B7D: F7          rst  $30
+2B7D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2B7E: DD 21 B1 84 ld   ix,$84B1
 2B82: FD 21 67 83 ld   iy,$8367
 2B86: 06 04       ld   b,$04
 2B88: C5          push bc
-2B89: CD D8 2A    call $2AD8
+2B89: CD D8 2A    call object_path_step_2ad8
 2B8C: FE 01       cp   $01
 2B8E: 28 5B       jr   z,$2BEB
 2B90: 30 0A       jr   nc,$2B9C
@@ -5618,7 +6632,7 @@ music_sequencer_0c00:
 2B9F: EB          ex   de,hl
 2BA0: 09          add  hl,bc
 2BA1: 0E 00       ld   c,$00
-2BA3: 3A 5B 83    ld   a,($835B)
+2BA3: 3A 5B 83    ld   a,(object_pos_835b)
 2BA6: E6 20       and  $20
 2BA8: 28 0A       jr   z,$2BB4
 2BAA: 0C          inc  c
@@ -5634,7 +6648,7 @@ music_sequencer_0c00:
 2BBA: FD CB 04 7E bit  7,(iy+$04)
 2BBE: 20 05       jr   nz,$2BC5
 2BC0: 3E A5       ld   a,$A5
-2BC2: 32 0B D5    ld   ($D50B),a
+2BC2: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A5
 2BC5: 7C          ld   a,h
 2BC6: F6 80       or   $80
 2BC8: 67          ld   h,a
@@ -5662,7 +6676,7 @@ music_sequencer_0c00:
 2BF1: FD 19       add  iy,de
 2BF3: 10 93       djnz $2B88
 2BF5: 3E 01       ld   a,$01
-2BF7: F7          rst  $30
+2BF7: F7          rst  $30                  ; SLEEP 1 frame (yield)
 2BF8: 06 02       ld   b,$02
 2BFA: C5          push bc
 2BFB: DD 7E 00    ld   a,(ix+$00)
@@ -5756,7 +6770,7 @@ music_sequencer_0c00:
 2C9E: B8          cp   b
 2C9F: 38 02       jr   c,$2CA3
 2CA1: 1E 02       ld   e,$02
-2CA3: 3A 5B 83    ld   a,($835B)
+2CA3: 3A 5B 83    ld   a,(object_pos_835b)
 2CA6: E6 20       and  $20
 2CA8: 20 52       jr   nz,$2CFC
 2CAA: DD 71 48    ld   (ix+$48),c
@@ -5770,7 +6784,7 @@ music_sequencer_0c00:
 2CBC: 20 07       jr   nz,$2CC5
 2CBE: 08          ex   af,af'
 2CBF: 3E A5       ld   a,$A5
-2CC1: 32 0B D5    ld   ($D50B),a
+2CC1: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A5
 2CC4: 08          ex   af,af'
 2CC5: F6 80       or   $80
 2CC7: FD 77 04    ld   (iy+$04),a
@@ -5814,7 +6828,7 @@ music_sequencer_0c00:
 2D1A: CB 61       bit  4,c
 2D1C: 20 0C       jr   nz,$2D2A
 2D1E: 67          ld   h,a
-2D1F: 3A 5B 83    ld   a,($835B)
+2D1F: 3A 5B 83    ld   a,(object_pos_835b)
 2D22: A1          and  c
 2D23: E6 60       and  $60
 2D25: 20 03       jr   nz,$2D2A
@@ -5855,7 +6869,7 @@ music_sequencer_0c00:
 2D66: DD 23       inc  ix
 2D68: 06 06       ld   b,$06
 2D6A: C5          push bc
-2D6B: CD D8 2A    call $2AD8
+2D6B: CD D8 2A    call object_path_step_2ad8
 2D6E: FE 02       cp   $02
 2D70: DA B2 2E    jp   c,$2EB2
 2D73: 28 39       jr   z,$2DAE
@@ -5875,17 +6889,17 @@ music_sequencer_0c00:
 2D97: 77          ld   (hl),a
 2D98: 3E 3F       ld   a,$3F
 2D9A: 32 1A 84    ld   ($841A),a
-2D9D: 3A 5B 83    ld   a,($835B)
+2D9D: 3A 5B 83    ld   a,(object_pos_835b)
 2DA0: E6 BF       and  $BF
-2DA2: 32 5B 83    ld   ($835B),a
+2DA2: 32 5B 83    ld   (object_pos_835b),a
 2DA5: C2 B2 2E    jp   nz,$2EB2
 2DA8: 3E 2C       ld   a,$2C
-2DAA: CF          rst  $08
+2DAA: CF          rst  $08                  ; SPAWN task $2C (task2c_s2_drift_21da)
 2DAB: C3 B2 2E    jp   $2EB2
 2DAE: DD 7E 6C    ld   a,(ix+$6c)
 2DB1: A7          and  a
 2DB2: 20 5B       jr   nz,$2E0F
-2DB4: 21 5B 83    ld   hl,$835B
+2DB4: 21 5B 83    ld   hl,object_pos_835b
 2DB7: 7E          ld   a,(hl)
 2DB8: E6 C0       and  $C0
 2DBA: C2 89 2E    jp   nz,$2E89
@@ -5909,29 +6923,29 @@ music_sequencer_0c00:
 2DE1: FE 0C       cp   $0C
 2DE3: D2 89 2E    jp   nc,$2E89
 2DE6: 3E BC       ld   a,$BC
-2DE8: 32 0B D5    ld   ($D50B),a
+2DE8: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $BC
 2DEB: 21 52 84    ld   hl,$8452
 2DEE: 7E          ld   a,(hl)
-2DEF: D7          rst  $10
+2DEF: D7          rst  $10                  ; KILL task A
 2DF0: 36 2D       ld   (hl),$2D
 2DF2: 3E 2D       ld   a,$2D
-2DF4: CF          rst  $08
+2DF4: CF          rst  $08                  ; SPAWN task $2D (task2d_s2_idle_256c)
 2DF5: 23          inc  hl
 2DF6: 7E          ld   a,(hl)
-2DF7: D7          rst  $10
+2DF7: D7          rst  $10                  ; KILL task A
 2DF8: 36 2C       ld   (hl),$2C
-2DFA: 3A 5B 83    ld   a,($835B)
+2DFA: 3A 5B 83    ld   a,(object_pos_835b)
 2DFD: F6 40       or   $40
-2DFF: 32 5B 83    ld   ($835B),a
+2DFF: 32 5B 83    ld   (object_pos_835b),a
 2E02: 3E FF       ld   a,$FF
 2E04: DD 77 6C    ld   (ix+$6c),a
 2E07: 3E 3F       ld   a,$3F
 2E09: 32 C6 83    ld   ($83C6),a
 2E0C: C3 B2 2E    jp   $2EB2
-2E0F: 3A 5B 83    ld   a,($835B)
+2E0F: 3A 5B 83    ld   a,(object_pos_835b)
 2E12: E6 A0       and  $A0
 2E14: 20 17       jr   nz,$2E2D
-2E16: 3A D8 81    ld   a,($81D8)
+2E16: 3A D8 81    ld   a,(joystick_input_81d8)
 2E19: CB 47       bit  0,a
 2E1B: 20 04       jr   nz,$2E21
 2E1D: 3E FF       ld   a,$FF
@@ -5972,7 +6986,7 @@ music_sequencer_0c00:
 2E6A: 32 62 83    ld   ($8362),a
 2E6D: 32 66 83    ld   ($8366),a
 2E70: 47          ld   b,a
-2E71: 3A 5B 83    ld   a,($835B)
+2E71: 3A 5B 83    ld   a,(object_pos_835b)
 2E74: E6 20       and  $20
 2E76: 3E 08       ld   a,$08
 2E78: 20 01       jr   nz,$2E7B
@@ -6015,43 +7029,70 @@ music_sequencer_0c00:
 2EBA: 05          dec  b
 2EBB: C2 6A 2D    jp   nz,$2D6A
 2EBE: 3E 01       ld   a,$01
-2EC0: F7          rst  $30
-2EC1: C3 7B 2B    jp   $2B7B
+2EC0: F7          rst  $30                  ; SLEEP 1 frame (yield)
+2EC1: C3 7B 2B    jp   task2e_s2_objects_2b7b
 
-3000: C3 33 30    jp   $3033
-3003: C3 BA 33    jp   $33BA
-3006: C3 47 31    jp   $3147
-3009: C3 12 33    jp   $3312
-300C: C3 4B 34    jp   $344B
-300F: C3 6A 31    jp   $316A
-3012: C3 01 34    jp   $3401
-3015: C3 2B 38    jp   $382B
-3018: C3 F6 39    jp   $39F6
-301B: C3 AB 39    jp   $39AB
-301E: C3 05 58    jp   $5805
-3021: C3 63 39    jp   $3963
-3024: 00          nop
-3025: 00          nop
-3026: 00          nop
-3027: 00          nop
-3028: 00          nop
-3029: 00          nop
-302A: 00          nop
-302B: 00          nop
-302C: 00          nop
-302D: 00          nop
-302E: 00          nop
-302F: 00          nop
-3030: C3 70 58    jp   $5870
+;----------------------------------------------------------------------------
+; Task entry vectors of stage 3: $2E?..: 3033=$28, 33BA=$29, 3147..39AB = $30..$37, 5805=$49, 3963=$4A (see header).
+;----------------------------------------------------------------------------
+vec_task28_3000:
+3000: C3 33 30    jp   task28_s3_init_3033
+
+vec_task29_3003:
+3003: C3 BA 33    jp   task29_s3_stage_end_33ba
+
+vec_task30_3006:
+3006: C3 47 31    jp   task30_s3_start_3147
+
+vec_task31_3009:
+3009: C3 12 33    jp   task31_s3_input_3312
+
+vec_task32_300c:
+300C: C3 4B 34    jp   task32_s3_boulders_344b
+
+vec_task33_300f:
+300F: C3 6A 31    jp   task33_s3_player_316a
+
+vec_task34_3012:
+3012: C3 01 34    jp   task34_s3_hill_scroll_3401
+
+vec_task35_3015:
+3015: C3 2B 38    jp   task35_s3_boulder_collision_382b
+
+vec_task36_3018:
+3018: C3 F6 39    jp   task36_s3_hilltop_39f6
+
+vec_task37_301b:
+301B: C3 AB 39    jp   task37_s3_death_39ab
+
+vec_task49_301e:
+301E: C3 05 58    jp   task49_s3_final_jump_5805
+
+vec_task4a_3021:
+3021: C3 63 39    jp   task4a_s3_player_sfx_3963
+
+
+;----------------------------------------------------------------------------
+; jp death_scroll_loop_5870 (used by stages 1, 3 and 4 when the player dies).
+;----------------------------------------------------------------------------
+vector_death_scroll_3030:
+3030: C3 70 58    jp   death_scroll_loop_5870
+
+;----------------------------------------------------------------------------
+; === TASK $28 : STAGE 3 (HILL / BOULDERS) INIT ===  in: C = round, F.Z
+; Variables, per-round data ($6800+..), checkpoint $81E9/$81EB, map
+; $6BD0/$6BE0, RAM trampolines, spawns $30, kills itself.
+;----------------------------------------------------------------------------
+task28_s3_init_3033:
 3033: 3E 01       ld   a,$01
-3035: F7          rst  $30
+3035: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3036: F5          push af
 3037: C5          push bc
-3038: CD 96 30    call $3096
+3038: CD 96 30    call s3_init_vars_3096
 303B: C1          pop  bc
 303C: F1          pop  af
 303D: 28 10       jr   z,$304F
-303F: 3A 56 81    ld   a,($8156)
+303F: 3A 56 81    ld   a,(cur_player_8156)
 3042: A7          and  a
 3043: 28 05       jr   z,$304A
 3045: 2A E9 81    ld   hl,($81E9)
@@ -6074,21 +7115,29 @@ music_sequencer_0c00:
 306A: 22 CB 84    ld   ($84CB),hl
 306D: 22 C9 84    ld   ($84C9),hl
 3070: 06 00       ld   b,$00
-3072: CD D8 02    call $02D8
+3072: CD D8 02    call vec_set_video_enable_02d8
 3075: 01 00 00    ld   bc,$0000
 3078: 3E 04       ld   a,$04
-307A: 32 5A 83    ld   ($835A),a
+307A: 32 5A 83    ld   (scroll_mode_835a),a
 307D: 21 D0 6B    ld   hl,$6BD0
 3080: 11 E0 6B    ld   de,$6BE0
-3083: CD DB 02    call $02DB
+3083: CD DB 02    call vec_init_scrolling_map_02db
 3086: 3E 0B       ld   a,$0B
-3088: 32 00 D3    ld   ($D300),a
+3088: 32 00 D3    ld   (priority_d300),a
 308B: 3E FF       ld   a,$FF
 308D: 32 A0 84    ld   ($84A0),a
 3090: 3E 30       ld   a,$30
-3092: CF          rst  $08
+3092: CF          rst  $08                  ; SPAWN task $30 (task30_s3_start_3147)
 3093: 3E 28       ld   a,$28
-3095: D7          rst  $10
+3095: D7          rst  $10                  ; KILL task $28 (task28_s3_init_3033)
+
+;----------------------------------------------------------------------------
+; Stage 3 variables. Sets up RAM "JP" trampolines used as call-backs:
+; $8496 -> s3_set_boulder_sprite_3615, $8499 -> s3_scroll_speed_from_table_3749,
+; $849C -> s3_boulder_resume_351e (patched later by 39F6 for the final
+; part). $8571 = $026C = right x limit (a NUMBER, not the kernel routine).
+;----------------------------------------------------------------------------
+s3_init_vars_3096:
 3096: C5          push bc
 3097: 21 90 84    ld   hl,$8490
 309A: 36 00       ld   (hl),$00
@@ -6099,7 +7148,7 @@ music_sequencer_0c00:
 30A7: 11 62 85    ld   de,$8562
 30AA: 01 0F 00    ld   bc,$000F
 30AD: ED B0       ldir
-30AF: 21 5B 83    ld   hl,$835B
+30AF: 21 5B 83    ld   hl,object_pos_835b
 30B2: 36 00       ld   (hl),$00
 30B4: 11 5C 83    ld   de,$835C
 30B7: 01 5F 00    ld   bc,$005F
@@ -6138,68 +7187,69 @@ music_sequencer_0c00:
 3107: 22 90 84    ld   ($8490),hl
 310A: 3E FE       ld   a,$FE
 310C: 32 93 84    ld   ($8493),a
-310F: 21 6C 02    ld   hl,save_registers_and_jump_026c
+310F: 21 6C 02    ld   hl,$026C             ; $026C = x limit (number, NOT the kernel routine)
 3112: 22 71 85    ld   ($8571),hl
 3115: 3E 04       ld   a,$04
 3117: 32 94 84    ld   ($8494),a
-311A: 3E C3       ld   a,$C3
+311A: 3E C3       ld   a,$C3                ; $C3 = JP opcode (RAM trampolines)
 311C: 32 96 84    ld   ($8496),a
 311F: 32 99 84    ld   ($8499),a
 3122: 32 9C 84    ld   ($849C),a
-3125: 21 15 36    ld   hl,$3615
+3125: 21 15 36    ld   hl,s3_set_boulder_sprite_3615
 3128: 22 97 84    ld   ($8497),hl
-312B: 21 49 37    ld   hl,$3749
+312B: 21 49 37    ld   hl,s3_scroll_speed_from_table_3749
 312E: 22 9A 84    ld   ($849A),hl
-3131: 21 1E 35    ld   hl,$351E
+3131: 21 1E 35    ld   hl,s3_boulder_resume_351e
 3134: 22 9D 84    ld   ($849D),hl
 3137: C9          ret
-3138: 00          nop
-3139: 00          nop
-313A: 06 00       ld   b,$00
-313C: 00          nop
-313D: 00          nop
-313E: FF          rst  $38
-313F: 00          nop
-3140: 00          nop
-3141: C6 02       add  a,$02
-3143: 14          inc  d
-3144: 00          nop
-3145: 00          nop
-3146: 00          nop
+
+table_s3_init_3138:
+
+;----------------------------------------------------------------------------
+; === TASK $30 : stage 3 start: spawns $04,$34,$33,$05,$31,$32,$35,$4A, video on, dies ===
+;----------------------------------------------------------------------------
+task30_s3_start_3147:
 3147: 3E 01       ld   a,$01
-3149: F7          rst  $30
+3149: F7          rst  $30                  ; SLEEP 1 frame (yield)
 314A: 3E 04       ld   a,$04
-314C: CF          rst  $08
+314C: CF          rst  $08                  ; SPAWN task $04 (task04_scroll_117c)
 314D: 3E 34       ld   a,$34
-314F: CF          rst  $08
+314F: CF          rst  $08                  ; SPAWN task $34 (task34_s3_hill_scroll_3401)
 3150: 3E 33       ld   a,$33
-3152: CF          rst  $08
+3152: CF          rst  $08                  ; SPAWN task $33 (task33_s3_player_316a)
 3153: 3E 05       ld   a,$05
-3155: CF          rst  $08
+3155: CF          rst  $08                  ; SPAWN task $05 (task05_sprite_positions_13e2)
 3156: 3E 31       ld   a,$31
-3158: CF          rst  $08
+3158: CF          rst  $08                  ; SPAWN task $31 (task31_s3_input_3312)
 3159: 3E 32       ld   a,$32
-315B: CF          rst  $08
+315B: CF          rst  $08                  ; SPAWN task $32 (task32_s3_boulders_344b)
 315C: 3E 35       ld   a,$35
-315E: CF          rst  $08
+315E: CF          rst  $08                  ; SPAWN task $35 (task35_s3_boulder_collision_382b)
 315F: 3E 4A       ld   a,$4A
-3161: CF          rst  $08
+3161: CF          rst  $08                  ; SPAWN task $4A (task4a_s3_player_sfx_3963)
 3162: 06 F0       ld   b,$F0
-3164: CD D8 02    call $02D8
+3164: CD D8 02    call vec_set_video_enable_02d8
 3167: 3E 30       ld   a,$30
-3169: D7          rst  $10
+3169: D7          rst  $10                  ; KILL task $30 (task30_s3_start_3147)
+
+;----------------------------------------------------------------------------
+; === TASK $33 : stage 3 player: speed, frame tick, walk/jump animation, sprites ===
+;----------------------------------------------------------------------------
+task33_s3_player_316a:
 316A: 3E 01       ld   a,$01
-316C: F7          rst  $30
-316D: CD DB 32    call $32DB
-3170: CD 19 37    call $3719
-3173: CD 53 37    call $3753
-3176: CD E4 31    call $31E4
-3179: CD 7E 31    call $317E
-317C: 18 EC       jr   $316A
+316C: F7          rst  $30                  ; SLEEP 1 frame (yield)
+316D: CD DB 32    call s3_update_speed_32db
+3170: CD 19 37    call s3_frame_tick_3719
+3173: CD 53 37    call s3_update_boulder_speed_3753
+3176: CD E4 31    call s3_player_walk_anim_31e4
+3179: CD 7E 31    call s3_draw_player_317e
+317C: 18 EC       jr   task33_s3_player_316a
+
+s3_draw_player_317e:
 317E: 06 00       ld   b,$00
 3180: 3A A6 84    ld   a,($84A6)
 3183: 11 67 85    ld   de,$8567
-3186: CD B2 36    call $36B2
+3186: CD B2 36    call anim_counter_step_36b2
 3189: 3A 66 85    ld   a,($8566)
 318C: 38 06       jr   c,$3194
 318E: 3C          inc  a
@@ -6227,7 +7277,7 @@ music_sequencer_0c00:
 31B6: 25          dec  h
 31B7: ED 5B 6B 85 ld   de,($856B)
 31BB: ED 4B 6D 85 ld   bc,($856D)
-31BF: CD 5E 36    call $365E
+31BF: CD 5E 36    call set_object_and_sprite_365e
 31C2: 3D          dec  a
 31C3: 08          ex   af,af'
 31C4: 3A 64 85    ld   a,($8564)
@@ -6248,8 +7298,10 @@ music_sequencer_0c00:
 31DC: ED 52       sbc  hl,de
 31DE: EB          ex   de,hl
 31DF: E1          pop  hl
-31E0: CD 5E 36    call $365E
+31E0: CD 5E 36    call set_object_and_sprite_365e
 31E3: C9          ret
+
+s3_player_walk_anim_31e4:
 31E4: 3A 64 85    ld   a,($8564)
 31E7: CB 47       bit  0,a
 31E9: 20 15       jr   nz,$3200
@@ -6298,10 +7350,10 @@ music_sequencer_0c00:
 3235: 5E          ld   e,(hl)
 3236: 16 00       ld   d,$00
 3238: 2A 6B 85    ld   hl,($856B)
-323B: CD A5 36    call $36A5
-323E: CD 7E 32    call $327E
+323B: CD A5 36    call add_signed_magnitude_36a5
+323E: CD 7E 32    call s3_clamp_x_327e
 3241: 22 6B 85    ld   ($856B),hl
-3244: CD 9E 32    call $329E
+3244: CD 9E 32    call s3_jump_path_step_329e
 3247: 3A 6B 85    ld   a,($856B)
 324A: D6 1C       sub  $1C
 324C: 47          ld   b,a
@@ -6338,6 +7390,7 @@ music_sequencer_0c00:
 327A: 32 A7 84    ld   ($84A7),a
 327D: C9          ret
 
+s3_clamp_x_327e:
 327E: E5          push hl
 327F: E5          push hl
 3280: ED 4B 71 85 ld   bc,($8571)
@@ -6357,11 +7410,13 @@ music_sequencer_0c00:
 3299: E1          pop  hl
 329A: 21 DC 02    ld   hl,$02DC
 329D: C9          ret
+
+s3_jump_path_step_329e:
 329E: 3A 64 85    ld   a,($8564)
 32A1: CB 47       bit  0,a
 32A3: C8          ret  z
 32A4: 3A 62 85    ld   a,($8562)
-32A7: CD E2 36    call $36E2
+32A7: CD E2 36    call test_tick_mask_a5_36e2
 32AA: C8          ret  z
 32AB: 2A 69 85    ld   hl,($8569)
 32AE: 5E          ld   e,(hl)
@@ -6374,18 +7429,20 @@ music_sequencer_0c00:
 32B8: FE FF       cp   $FF
 32BA: 28 19       jr   z,$32D5
 32BC: 2A 6B 85    ld   hl,($856B)
-32BF: CD A5 36    call $36A5
-32C2: CD 7E 32    call $327E
+32BF: CD A5 36    call add_signed_magnitude_36a5
+32C2: CD 7E 32    call s3_clamp_x_327e
 32C5: 22 6B 85    ld   ($856B),hl
 32C8: 5F          ld   e,a
 32C9: 16 00       ld   d,$00
 32CB: 2A 6F 85    ld   hl,($856F)
-32CE: CD A5 36    call $36A5
+32CE: CD A5 36    call add_signed_magnitude_36a5
 32D1: 22 6F 85    ld   ($856F),hl
 32D4: C9          ret
 32D5: 21 64 85    ld   hl,$8564
 32D8: CB 86       res  0,(hl)
 32DA: C9          ret
+
+s3_update_speed_32db:
 32DB: 3A A7 84    ld   a,($84A7)
 32DE: 47          ld   b,a
 32DF: 3A 64 85    ld   a,($8564)
@@ -6414,9 +7471,14 @@ music_sequencer_0c00:
 330D: 78          ld   a,b
 330E: 32 A6 84    ld   ($84A6),a
 3311: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $31 : stage 3 input -> player state $8564 (b0 jump, b1 duck, b5/b6 run, b2 idle) + jump path ===
+;----------------------------------------------------------------------------
+task31_s3_input_3312:
 3312: 3E 01       ld   a,$01
-3314: F7          rst  $30
-3315: 3A D8 81    ld   a,($81D8)
+3314: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3315: 3A D8 81    ld   a,(joystick_input_81d8)
 3318: 4F          ld   c,a
 3319: 3A 64 85    ld   a,($8564)
 331C: 47          ld   b,a
@@ -6498,9 +7560,14 @@ music_sequencer_0c00:
 33B0: 32 68 85    ld   ($8568),a
 33B3: 7B          ld   a,e
 33B4: 32 64 85    ld   ($8564),a
-33B7: C3 12 33    jp   $3312
+33B7: C3 12 33    jp   task31_s3_input_3312
+
+;----------------------------------------------------------------------------
+; === TASK $29 : stage 3 end: saves checkpoint, $8434 = $00 (cleared) or $FF (died), event 0 ===
+;----------------------------------------------------------------------------
+task29_s3_stage_end_33ba:
 33BA: 3E 30       ld   a,$30
-33BC: F7          rst  $30
+33BC: F7          rst  $30                  ; SLEEP 48 frames (yield)
 33BD: 3A 9F 84    ld   a,($849F)
 33C0: 6F          ld   l,a
 33C1: 26 00       ld   h,$00
@@ -6509,7 +7576,7 @@ music_sequencer_0c00:
 33C5: EB          ex   de,hl
 33C6: 2A C9 84    ld   hl,($84C9)
 33C9: 19          add  hl,de
-33CA: 3A 56 81    ld   a,($8156)
+33CA: 3A 56 81    ld   a,(cur_player_8156)
 33CD: A7          and  a
 33CE: 28 05       jr   z,$33D5
 33D0: 22 E9 81    ld   ($81E9),hl
@@ -6519,37 +7586,44 @@ music_sequencer_0c00:
 33DB: 3C          inc  a
 33DC: 28 11       jr   z,$33EF
 33DE: 3E FF       ld   a,$FF
-33E0: 32 5A 83    ld   ($835A),a
+33E0: 32 5A 83    ld   (scroll_mode_835a),a
 33E3: 3E 00       ld   a,$00
-33E5: 32 34 84    ld   ($8434),a
+33E5: 32 34 84    ld   (player_died_8434),a
 33E8: 3E 00       ld   a,$00
-33EA: EF          rst  $28
-33EB: D9          exx
+33EA: EF          rst  $28                  ; SIGNAL event $00 - event 0
+33EB: D9          exx                       ; generic 'kill myself'
 33EC: 79          ld   a,c
 33ED: D9          exx
-33EE: D7          rst  $10
+33EE: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
 33EF: 3E FF       ld   a,$FF
-33F1: 32 5A 83    ld   ($835A),a
+33F1: 32 5A 83    ld   (scroll_mode_835a),a
 33F4: 3E FF       ld   a,$FF
-33F6: 32 34 84    ld   ($8434),a
+33F6: 32 34 84    ld   (player_died_8434),a
 33F9: 3E 00       ld   a,$00
-33FB: EF          rst  $28
-33FC: D9          exx
+33FB: EF          rst  $28                  ; SIGNAL event $00 - event 0
+33FC: D9          exx                       ; generic 'kill myself'
 33FD: 79          ld   a,c
 33FE: D9          exx
-33FF: D7          rst  $10
+33FF: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
 3400: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $34 : hill slope scroll (layer 2 column scroll from the slope script) ===
+;----------------------------------------------------------------------------
+task34_s3_hill_scroll_3401:
 3401: 3E 01       ld   a,$01
-3403: F7          rst  $30
-3404: CD 99 84    call $8499
-3407: CD 77 37    call $3777
-340A: CD 0F 34    call $340F
-340D: 18 F2       jr   $3401
+3403: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3404: CD 99 84    call $8499                ; call-back through RAM trampoline
+3407: CD 77 37    call s3_hill_script_3777
+340A: CD 0F 34    call s3_update_column_scroll_340f
+340D: 18 F2       jr   task34_s3_hill_scroll_3401
+
+s3_update_column_scroll_340f:
 340F: 3E FF       ld   a,$FF
 3411: 32 1D 84    ld   ($841D),a
 3414: 3A 93 84    ld   a,($8493)
 3417: 57          ld   d,a
-3418: 3A FB 82    ld   a,($82FB)
+3418: 3A FB 82    ld   a,(scroll_l2_x_82fb)
 341B: 47          ld   b,a
 341C: E6 F0       and  $F0
 341E: 0F          rrca
@@ -6570,7 +7644,7 @@ music_sequencer_0c00:
 3433: 59          ld   e,c
 3434: 16 00       ld   d,$00
 3436: CB 23       sla  e
-3438: 21 95 81    ld   hl,$8195
+3438: 21 95 81    ld   hl,colscroll_l2_8195
 343B: 19          add  hl,de
 343C: 77          ld   (hl),a
 343D: 23          inc  hl
@@ -6584,11 +7658,18 @@ music_sequencer_0c00:
 3446: D6 03       sub  $03
 3448: 10 E9       djnz $3433
 344A: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $32 : boulders: spawn from the stage script, move along their paths (8 slots) ===
+;----------------------------------------------------------------------------
+task32_s3_boulders_344b:
 344B: 3E 01       ld   a,$01
-344D: F7          rst  $30
-344E: CD 56 34    call $3456
-3451: CD 9B 37    call $379B
-3454: 18 F5       jr   $344B
+344D: F7          rst  $30                  ; SLEEP 1 frame (yield)
+344E: CD 56 34    call s3_boulder_spawner_3456
+3451: CD 9B 37    call s3_score_popup_timers_379b
+3454: 18 F5       jr   task32_s3_boulders_344b
+
+s3_boulder_spawner_3456:
 3456: 3A D4 84    ld   a,($84D4)
 3459: B7          or   a
 345A: 28 11       jr   z,$346D
@@ -6602,7 +7683,7 @@ music_sequencer_0c00:
 3467: 23          inc  hl
 3468: 10 F7       djnz $3461
 346A: 3E 36       ld   a,$36
-346C: CF          rst  $08
+346C: CF          rst  $08                  ; SPAWN task $36 (task36_s3_hilltop_39f6)
 346D: 3A D3 84    ld   a,($84D3)
 3470: 3C          inc  a
 3471: 28 2E       jr   z,$34A1
@@ -6668,7 +7749,7 @@ music_sequencer_0c00:
 34DA: E5          push hl
 34DB: 78          ld   a,b
 34DC: 21 44 85    ld   hl,$8544
-34DF: CD 4F 36    call $364F
+34DF: CD 4F 36    call add_3a_to_hl_364f
 34E2: 5E          ld   e,(hl)
 34E3: 7B          ld   a,e
 34E4: A7          and  a
@@ -6695,9 +7776,9 @@ music_sequencer_0c00:
 3503: EB          ex   de,hl
 3504: 7E          ld   a,(hl)
 3505: CB 47       bit  0,a
-3507: CA 89 35    jp   z,$3589
+3507: CA 89 35    jp   z,s3_boulder_activate_3589
 350A: 1A          ld   a,(de)
-350B: CD DC 36    call $36DC
+350B: CD DC 36    call test_tick_mask_a4_36dc
 350E: 28 22       jr   z,$3532
 3510: C5          push bc
 3511: E5          push hl
@@ -6707,7 +7788,9 @@ music_sequencer_0c00:
 3517: D5          push de
 3518: E5          push hl
 3519: ED B0       ldir
-351B: CD 3A 35    call $353A
+351B: CD 3A 35    call s3_boulder_move_353a
+
+s3_boulder_resume_351e:
 351E: D1          pop  de
 351F: E1          pop  hl
 3520: C1          pop  bc
@@ -6717,7 +7800,7 @@ music_sequencer_0c00:
 3525: D5          push de
 3526: 78          ld   a,b
 3527: 21 44 85    ld   hl,$8544
-352A: CD 4F 36    call $364F
+352A: CD 4F 36    call add_3a_to_hl_364f
 352D: 3A D7 84    ld   a,($84D7)
 3530: 77          ld   (hl),a
 3531: E1          pop  hl
@@ -6726,6 +7809,8 @@ music_sequencer_0c00:
 3536: 19          add  hl,de
 3537: 10 A1       djnz $34DA
 3539: C9          ret
+
+s3_boulder_move_353a:
 353A: 3A D6 84    ld   a,($84D6)
 353D: 47          ld   b,a
 353E: 21 DF 84    ld   hl,$84DF
@@ -6737,8 +7822,8 @@ music_sequencer_0c00:
 3546: 23          inc  hl
 3547: 4E          ld   c,(hl)
 3548: B7          or   a
-3549: CC 58 35    call z,$3558
-354C: CD D3 35    call $35D3
+3549: CC 58 35    call z,s3_boulder_next_path_3558
+354C: CD D3 35    call s3_boulder_draw_35d3
 354F: 3D          dec  a
 3550: 71          ld   (hl),c
 3551: 2B          dec  hl
@@ -6748,7 +7833,9 @@ music_sequencer_0c00:
 3555: 2B          dec  hl
 3556: 73          ld   (hl),e
 3557: C9          ret
-3558: CD 7A 35    call $357A
+
+s3_boulder_next_path_3558:
+3558: CD 7A 35    call s3_read_path_ptr_357a
 355B: 08          ex   af,af'
 355C: 79          ld   a,c
 355D: 3C          inc  a
@@ -6761,11 +7848,15 @@ music_sequencer_0c00:
 3569: 23          inc  hl
 356A: 22 DB 84    ld   ($84DB),hl
 356D: 21 C0 68    ld   hl,$68C0
-3570: CD 41 36    call $3641
-3573: CD 7D 35    call $357D
+3570: CD 41 36    call table_word_lookup_3641
+3573: CD 7D 35    call s3_read_path_357d
 3576: 21 E2 84    ld   hl,$84E2
 3579: C9          ret
+
+s3_read_path_ptr_357a:
 357A: 2A DD 84    ld   hl,($84DD)
+
+s3_read_path_357d:
 357D: 5E          ld   e,(hl)
 357E: 23          inc  hl
 357F: 56          ld   d,(hl)
@@ -6776,6 +7867,8 @@ music_sequencer_0c00:
 3584: 23          inc  hl
 3585: 22 DD 84    ld   ($84DD),hl
 3588: C9          ret
+
+s3_boulder_activate_3589:
 3589: C5          push bc
 358A: E5          push hl
 358B: 13          inc  de
@@ -6783,13 +7876,15 @@ music_sequencer_0c00:
 358F: C5          push bc
 3590: D5          push de
 3591: E5          push hl
+
+s3_boulder_activate_set_3592:
 3592: CB C7       set  0,a
 3594: EB          ex   de,hl
 3595: 77          ld   (hl),a
 3596: 3A D7 84    ld   a,($84D7)
 3599: 3D          dec  a
 359A: 21 80 68    ld   hl,$6880
-359D: CD 41 36    call $3641
+359D: CD 41 36    call table_word_lookup_3641
 35A0: 7E          ld   a,(hl)
 35A1: 23          inc  hl
 35A2: 32 E3 84    ld   ($84E3),a
@@ -6797,11 +7892,11 @@ music_sequencer_0c00:
 35A6: 23          inc  hl
 35A7: 22 DB 84    ld   ($84DB),hl
 35AA: 21 C0 68    ld   hl,$68C0
-35AD: CD 41 36    call $3641
+35AD: CD 41 36    call table_word_lookup_3641
 35B0: 22 DD 84    ld   ($84DD),hl
 35B3: 3A DA 84    ld   a,($84DA)
 35B6: 21 FC 68    ld   hl,$68FC
-35B9: CD 56 36    call $3656
+35B9: CD 56 36    call add_4a_to_hl_3656
 35BC: 5E          ld   e,(hl)
 35BD: 23          inc  hl
 35BE: 56          ld   d,(hl)
@@ -6812,10 +7907,12 @@ music_sequencer_0c00:
 35C3: 3E 00       ld   a,$00
 35C5: 08          ex   af,af'
 35C6: 3A D6 84    ld   a,($84D6)
-35C9: CD 96 84    call $8496
+35C9: CD 96 84    call $8496                ; call-back through RAM trampoline
 35CC: AF          xor  a
 35CD: 32 E1 84    ld   ($84E1),a
-35D0: C3 9C 84    jp   $849C
+35D0: C3 9C 84    jp   $849C                ; jump through RAM trampoline
+
+s3_boulder_draw_35d3:
 35D3: F5          push af
 35D4: C5          push bc
 35D5: D5          push de
@@ -6828,23 +7925,23 @@ music_sequencer_0c00:
 35DC: 16 00       ld   d,$00
 35DE: 42          ld   b,d
 35DF: D5          push de
-35E0: CD 90 36    call $3690
+35E0: CD 90 36    call get_object_pos_3690
 35E3: 50          ld   d,b
 35E4: 59          ld   e,c
 35E5: FD E5       push iy
 35E7: E1          pop  hl
-35E8: CD A5 36    call $36A5
+35E8: CD A5 36    call add_signed_magnitude_36a5
 35EB: 44          ld   b,h
 35EC: 4D          ld   c,l
 35ED: D1          pop  de
 35EE: DD E5       push ix
 35F0: E1          pop  hl
-35F1: CD A5 36    call $36A5
+35F1: CD A5 36    call add_signed_magnitude_36a5
 35F4: EB          ex   de,hl
 35F5: CB 42       bit  0,d
 35F7: 28 05       jr   z,$35FE
 35F9: CB 4A       bit  1,d
-35FB: C4 08 36    call nz,$3608
+35FB: C4 08 36    call nz,s3_clear_flags_3608
 35FE: CD 96 84    call $8496
 3601: F1          pop  af
 3602: 08          ex   af,af'
@@ -6853,6 +7950,8 @@ music_sequencer_0c00:
 3605: C1          pop  bc
 3606: F1          pop  af
 3607: C9          ret
+
+s3_clear_flags_3608:
 3608: F5          push af
 3609: E5          push hl
 360A: 21 D7 84    ld   hl,$84D7
@@ -6864,6 +7963,8 @@ music_sequencer_0c00:
 3612: E1          pop  hl
 3613: F1          pop  af
 3614: C9          ret
+
+s3_set_boulder_sprite_3615:
 3615: E5          push hl
 3616: 67          ld   h,a
 3617: 08          ex   af,af'
@@ -6871,7 +7972,7 @@ music_sequencer_0c00:
 3619: F5          push af
 361A: F5          push af
 361B: CB 6F       bit  5,a
-361D: C4 DE 37    call nz,$37DE
+361D: C4 DE 37    call nz,s3_show_score_popup_37de
 3620: CB 67       bit  4,a
 3622: 28 05       jr   z,$3629
 3624: 3E FF       ld   a,$FF
@@ -6888,28 +7989,36 @@ music_sequencer_0c00:
 3635: 21 E3 84    ld   hl,$84E3
 3638: 86          add  a,(hl)
 3639: E1          pop  hl
-363A: CD 5E 36    call $365E
+363A: CD 5E 36    call set_object_and_sprite_365e
 363D: F1          pop  af
 363E: 08          ex   af,af'
 363F: E1          pop  hl
 3640: C9          ret
-3641: CD 49 36    call $3649
+
+table_word_lookup_3641:
+3641: CD 49 36    call add_2a_to_hl_3649
 3644: 5E          ld   e,(hl)
 3645: 23          inc  hl
 3646: 56          ld   d,(hl)
 3647: EB          ex   de,hl
 3648: C9          ret
+
+add_2a_to_hl_3649:
 3649: 5F          ld   e,a
 364A: 16 00       ld   d,$00
 364C: 19          add  hl,de
 364D: 19          add  hl,de
 364E: C9          ret
+
+add_3a_to_hl_364f:
 364F: 5F          ld   e,a
 3650: 16 00       ld   d,$00
 3652: 19          add  hl,de
 3653: 19          add  hl,de
 3654: 19          add  hl,de
 3655: C9          ret
+
+add_4a_to_hl_3656:
 3656: 5F          ld   e,a
 3657: 16 00       ld   d,$00
 3659: 19          add  hl,de
@@ -6918,11 +8027,15 @@ music_sequencer_0c00:
 365C: 19          add  hl,de
 365D: C9          ret
 
+;----------------------------------------------------------------------------
+; Set object A position (D,E = x_hi,x ; B,C = y_hi,y) and its sprite code/attr (H/L).
+;----------------------------------------------------------------------------
+set_object_and_sprite_365e:
 365E: 08          ex   af,af'
 365F: F5          push af
 3660: 7C          ld   a,h
 3661: E5          push hl
-3662: CD 80 36    call $3680
+3662: CD 80 36    call get_object_ptr_3680
 3665: 72          ld   (hl),d
 3666: 23          inc  hl
 3667: 73          ld   (hl),e
@@ -6934,7 +8047,7 @@ music_sequencer_0c00:
 366D: E5          push hl
 366E: D5          push de
 366F: E5          push hl
-3670: CD 8B 36    call $368B
+3670: CD 8B 36    call get_sprite_ptr_368b
 3673: D1          pop  de
 3674: 23          inc  hl
 3675: 23          inc  hl
@@ -6948,18 +8061,24 @@ music_sequencer_0c00:
 367D: F1          pop  af
 367E: 08          ex   af,af'
 367F: C9          ret
-3680: 21 5B 83    ld   hl,$835B
+
+get_object_ptr_3680:
+3680: 21 5B 83    ld   hl,object_pos_835b
 3683: F5          push af
 3684: D5          push de
-3685: CD 56 36    call $3656
+3685: CD 56 36    call add_4a_to_hl_3656
 3688: D1          pop  de
 3689: F1          pop  af
 368A: C9          ret
-368B: 21 BB 83    ld   hl,$83BB
+
+get_sprite_ptr_368b:
+368B: 21 BB 83    ld   hl,sprite_shadow_83bb
 368E: 18 F3       jr   $3683
+
+get_object_pos_3690:
 3690: D5          push de
 3691: E5          push hl
-3692: CD 80 36    call $3680
+3692: CD 80 36    call get_object_ptr_3680
 3695: 56          ld   d,(hl)
 3696: 23          inc  hl
 3697: 5E          ld   e,(hl)
@@ -6974,6 +8093,11 @@ music_sequencer_0c00:
 36A2: E1          pop  hl
 36A3: D1          pop  de
 36A4: C9          ret
+
+;----------------------------------------------------------------------------
+; HL += E where E is sign+magnitude (bit 7 = subtract).
+;----------------------------------------------------------------------------
+add_signed_magnitude_36a5:
 36A5: CB 7B       bit  7,e
 36A7: 28 07       jr   z,$36B0
 36A9: CB BB       res  7,e
@@ -6982,6 +8106,8 @@ music_sequencer_0c00:
 36AE: 18 01       jr   $36B1
 36B0: 19          add  hl,de
 36B1: C9          ret
+
+anim_counter_step_36b2:
 36B2: B7          or   a
 36B3: 28 18       jr   z,$36CD
 36B5: 3D          dec  a
@@ -7005,20 +8131,18 @@ music_sequencer_0c00:
 36CD: AF          xor  a
 36CE: 12          ld   (de),a
 36CF: C9          ret
-36D0: 0B          dec  bc
-36D1: 0B          dec  bc
-36D2: 0A          ld   a,(bc)
-36D3: 0A          ld   a,(bc)
-36D4: 07          rlca
-36D5: 07          rlca
-36D6: 06 06       ld   b,$06
-36D8: 05          dec  b
-36D9: 05          dec  b
-36DA: 04          inc  b
-36DB: 03          inc  bc
+
+table_anim_limits_36d0:
+
+;----------------------------------------------------------------------------
+; Z flag = tick mask bit test ($84A4 / $84A5 bit A&7) -> 'every n frames' tests.
+;----------------------------------------------------------------------------
+test_tick_mask_a4_36dc:
 36DC: 08          ex   af,af'
 36DD: 3A A4 84    ld   a,($84A4)
 36E0: 18 04       jr   $36E6
+
+test_tick_mask_a5_36e2:
 36E2: 08          ex   af,af'
 36E3: 3A A5 84    ld   a,($84A5)
 36E6: 08          ex   af,af'
@@ -7052,19 +8176,23 @@ music_sequencer_0c00:
 3716: C1          pop  bc
 3717: E1          pop  hl
 3718: C9          ret
+
+s3_frame_tick_3719:
 3719: 2A A2 84    ld   hl,($84A2)
 371C: 23          inc  hl
 371D: 22 A2 84    ld   ($84A2),hl
 3720: 11 A4 84    ld   de,$84A4
 3723: 7D          ld   a,l
 3724: E6 07       and  $07
-3726: CD 34 37    call $3734
+3726: CD 34 37    call lookup_tick_mask_3734
 3729: 13          inc  de
 372A: 3A A2 84    ld   a,($84A2)
 372D: CB 47       bit  0,a
 372F: 28 0D       jr   z,$373E
 3731: E6 0E       and  $0E
 3733: 0F          rrca
+
+lookup_tick_mask_3734:
 3734: 4F          ld   c,a
 3735: 06 00       ld   b,$00
 3737: 21 41 37    ld   hl,$3741
@@ -7075,14 +8203,19 @@ music_sequencer_0c00:
 373E: AF          xor  a
 373F: 18 FB       jr   $373C
 
+s3_scroll_speed_from_table_3749:
 3749: 21 66 37    ld   hl,$3766
-374C: CD 5D 37    call $375D
-374F: 32 45 83    ld   ($8345),a
+374C: CD 5D 37    call table_by_speed_index_375d
+374F: 32 45 83    ld   (scroll_speed_8345),a
 3752: C9          ret
+
+s3_update_boulder_speed_3753:
 3753: 21 A9 84    ld   hl,$84A9
-3756: CD 5D 37    call $375D
+3756: CD 5D 37    call table_by_speed_index_375d
 3759: 32 62 85    ld   ($8562),a
 375C: C9          ret
+
+table_by_speed_index_375d:
 375D: 3A A6 84    ld   a,($84A6)
 3760: 4F          ld   c,a
 3761: 06 00       ld   b,$00
@@ -7090,14 +8223,20 @@ music_sequencer_0c00:
 3764: 7E          ld   a,(hl)
 3765: C9          ret
 
+;----------------------------------------------------------------------------
+; Hill slope script ($8490): next value -> $8493. $8492=$FF selects the end script $3A79.
+;----------------------------------------------------------------------------
+s3_hill_script_3777:
 3777: 3A 92 84    ld   a,($8492)
 377A: 3C          inc  a
-377B: 20 0D       jr   nz,$378A
+377B: 20 0D       jr   nz,s3_hill_script_step_378a
 377D: 32 92 84    ld   ($8492),a
 3780: 3E 84       ld   a,$84
-3782: 32 0B D5    ld   ($D50B),a
+3782: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $84
 3785: 21 79 3A    ld   hl,$3A79
 3788: 18 03       jr   $378D
+
+s3_hill_script_step_378a:
 378A: 2A 90 84    ld   hl,($8490)
 378D: 7E          ld   a,(hl)
 378E: B7          or   a
@@ -7107,6 +8246,8 @@ music_sequencer_0c00:
 3795: C6 FE       add  a,$FE
 3797: 32 93 84    ld   ($8493),a
 379A: C9          ret
+
+s3_score_popup_timers_379b:
 379B: 3A D2 84    ld   a,($84D2)
 379E: 47          ld   b,a
 379F: 3E FF       ld   a,$FF
@@ -7140,6 +8281,8 @@ music_sequencer_0c00:
 37D9: 78          ld   a,b
 37DA: 32 D2 84    ld   ($84D2),a
 37DD: C9          ret
+
+s3_show_score_popup_37de:
 37DE: F5          push af
 37DF: D5          push de
 37E0: E5          push hl
@@ -7185,8 +8328,13 @@ music_sequencer_0c00:
 3828: D1          pop  de
 3829: F1          pop  af
 382A: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $35 : boulders vs player: death (spawns $37) or points for jumping/ducking (5/10/20 ticks, popups) ===
+;----------------------------------------------------------------------------
+task35_s3_boulder_collision_382b:
 382B: 3E 01       ld   a,$01
-382D: F7          rst  $30
+382D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 382E: 3E FF       ld   a,$FF
 3830: 32 64 83    ld   ($8364),a
 3833: 32 68 83    ld   ($8368),a
@@ -7255,10 +8403,10 @@ music_sequencer_0c00:
 38A3: FE 0D       cp   $0D
 38A5: 30 09       jr   nc,$38B0
 38A7: 3E BD       ld   a,$BD
-38A9: 32 0B D5    ld   ($D50B),a
+38A9: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $BD
 38AC: E1          pop  hl
 38AD: 3E 37       ld   a,$37
-38AF: CF          rst  $08
+38AF: CF          rst  $08                  ; SPAWN task $37 (task37_s3_death_39ab)
 38B0: 08          ex   af,af'
 38B1: CB 7F       bit  7,a
 38B3: 28 3F       jr   z,$38F4
@@ -7323,11 +8471,11 @@ music_sequencer_0c00:
 3909: CB 4F       bit  1,a
 390B: 20 40       jr   nz,$394D
 390D: 3E AB       ld   a,$AB
-390F: 32 0B D5    ld   ($D50B),a
+390F: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AB
 3912: 06 05       ld   b,$05
-3914: 3A 74 81    ld   a,($8174)
+3914: 3A 74 81    ld   a,(pending_score_ticks_8174)
 3917: 80          add  a,b
-3918: 32 74 81    ld   ($8174),a
+3918: 32 74 81    ld   (pending_score_ticks_8174),a
 391B: 08          ex   af,af'
 391C: CB DF       set  3,a
 391E: CB FF       set  7,a
@@ -7344,32 +8492,37 @@ music_sequencer_0c00:
 392B: B7          or   a
 392C: C2 5C 38    jp   nz,$385C
 392F: D9          exx
-3930: C3 2B 38    jp   $382B
+3930: C3 2B 38    jp   task35_s3_boulder_collision_382b
 3933: 3A 64 85    ld   a,($8564)
 3936: CB 47       bit  0,a
 3938: 28 D3       jr   z,$390D
 393A: 3E AD       ld   a,$AD
-393C: 32 0B D5    ld   ($D50B),a
+393C: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AD
 393F: 06 14       ld   b,$14
-3941: 3A 74 81    ld   a,($8174)
+3941: 3A 74 81    ld   a,(pending_score_ticks_8174)
 3944: 80          add  a,b
-3945: 32 74 81    ld   ($8174),a
+3945: 32 74 81    ld   (pending_score_ticks_8174),a
 3948: 08          ex   af,af'
 3949: CB EF       set  5,a
 394B: 18 D1       jr   $391E
 394D: 3E AC       ld   a,$AC
-394F: 32 0B D5    ld   ($D50B),a
+394F: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AC
 3952: 06 0A       ld   b,$0A
-3954: 3A 74 81    ld   a,($8174)
+3954: 3A 74 81    ld   a,(pending_score_ticks_8174)
 3957: 80          add  a,b
-3958: 32 74 81    ld   ($8174),a
+3958: 32 74 81    ld   (pending_score_ticks_8174),a
 395B: 08          ex   af,af'
 395C: CB E7       set  4,a
 395E: 18 BE       jr   $391E
 3960: 08          ex   af,af'
 3961: 18 BF       jr   $3922
+
+;----------------------------------------------------------------------------
+; === TASK $4A : sound effects on player state changes (jump $96, duck $97, run $95) ===
+;----------------------------------------------------------------------------
+task4a_s3_player_sfx_3963:
 3963: 3E 01       ld   a,$01
-3965: F7          rst  $30
+3965: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3966: 3A 94 84    ld   a,($8494)
 3969: 47          ld   b,a
 396A: 3A 64 85    ld   a,($8564)
@@ -7381,7 +8534,7 @@ music_sequencer_0c00:
 3976: CB 40       bit  0,b
 3978: 20 07       jr   nz,$3981
 397A: 3E 96       ld   a,$96
-397C: 32 0B D5    ld   ($D50B),a
+397C: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $96
 397F: 18 22       jr   $39A3
 3981: CB 49       bit  1,c
 3983: 28 0D       jr   z,$3992
@@ -7389,40 +8542,45 @@ music_sequencer_0c00:
 3987: CB 48       bit  1,b
 3989: 20 07       jr   nz,$3992
 398B: 3E 97       ld   a,$97
-398D: 32 0B D5    ld   ($D50B),a
+398D: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $97
 3990: 18 11       jr   $39A3
 3992: CB 42       bit  0,d
 3994: 28 0D       jr   z,$39A3
 3996: CB 78       bit  7,b
 3998: 20 05       jr   nz,$399F
 399A: 3E 95       ld   a,$95
-399C: 32 0B D5    ld   ($D50B),a
+399C: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $95
 399F: CB F9       set  7,c
 39A1: 18 02       jr   $39A5
 39A3: CB B9       res  7,c
 39A5: 79          ld   a,c
 39A6: 32 94 84    ld   ($8494),a
-39A9: 18 B8       jr   $3963
+39A9: 18 B8       jr   task4a_s3_player_sfx_3963
+
+;----------------------------------------------------------------------------
+; === TASK $37 : stage 3 death: kills the stage tasks, spawns $29, then death scroll loop ===
+;----------------------------------------------------------------------------
+task37_s3_death_39ab:
 39AB: 3E 31       ld   a,$31
-39AD: D7          rst  $10
+39AD: D7          rst  $10                  ; KILL task $31 (task31_s3_input_3312)
 39AE: 3E 33       ld   a,$33
-39B0: D7          rst  $10
+39B0: D7          rst  $10                  ; KILL task $33 (task33_s3_player_316a)
 39B1: 3E 04       ld   a,$04
-39B3: D7          rst  $10
+39B3: D7          rst  $10                  ; KILL task $04 (task04_scroll_117c)
 39B4: 3E 34       ld   a,$34
-39B6: D7          rst  $10
+39B6: D7          rst  $10                  ; KILL task $34 (task34_s3_hill_scroll_3401)
 39B7: 3E 35       ld   a,$35
-39B9: D7          rst  $10
+39B9: D7          rst  $10                  ; KILL task $35 (task35_s3_boulder_collision_382b)
 39BA: 3E 4A       ld   a,$4A
-39BC: D7          rst  $10
+39BC: D7          rst  $10                  ; KILL task $4A (task4a_s3_player_sfx_3963)
 39BD: 3E FF       ld   a,$FF
 39BF: 32 A8 84    ld   ($84A8),a
 39C2: 3E 01       ld   a,$01
-39C4: F7          rst  $30
-39C5: CD 19 37    call $3719
+39C4: F7          rst  $30                  ; SLEEP 1 frame (yield)
+39C5: CD 19 37    call s3_frame_tick_3719
 39C8: 21 64 85    ld   hl,$8564
 39CB: CB CE       set  1,(hl)
-39CD: CD 7E 31    call $317E
+39CD: CD 7E 31    call s3_draw_player_317e
 39D0: 3E 30       ld   a,$30
 39D2: 32 C2 83    ld   ($83C2),a
 39D5: 3C          inc  a
@@ -7431,33 +8589,38 @@ music_sequencer_0c00:
 39DC: CB 47       bit  0,a
 39DE: 20 0B       jr   nz,$39EB
 39E0: 3E 29       ld   a,$29
-39E2: CF          rst  $08
+39E2: CF          rst  $08                  ; SPAWN task $29 (task29_s3_stage_end_33ba)
 39E3: 3E FF       ld   a,$FF
 39E5: 32 A4 84    ld   ($84A4),a
-39E8: C3 70 58    jp   $5870
+39E8: C3 70 58    jp   death_scroll_loop_5870  ; -> death scroll loop
 39EB: E6 01       and  $01
 39ED: 32 64 85    ld   ($8564),a
-39F0: CD E4 31    call $31E4
+39F0: CD E4 31    call s3_player_walk_anim_31e4
 39F3: C3 C2 39    jp   $39C2
+
+;----------------------------------------------------------------------------
+; === TASK $36 : top of the hill: final big boulder (trampolines patched), spawns $49, dies ===
+;----------------------------------------------------------------------------
+task36_s3_hilltop_39f6:
 39F6: 3E 01       ld   a,$01
-39F8: F7          rst  $30
+39F8: F7          rst  $30                  ; SLEEP 1 frame (yield)
 39F9: 3A A8 84    ld   a,($84A8)
 39FC: 3C          inc  a
 39FD: 20 03       jr   nz,$3A02
 39FF: 3E 36       ld   a,$36
-3A01: D7          rst  $10
+3A01: D7          rst  $10                  ; KILL task $36 (task36_s3_hilltop_39f6)
 3A02: 3E 31       ld   a,$31
-3A04: D7          rst  $10
+3A04: D7          rst  $10                  ; KILL task $31 (task31_s3_input_3312)
 3A05: 3E 32       ld   a,$32
-3A07: D7          rst  $10
+3A07: D7          rst  $10                  ; KILL task $32 (task32_s3_boulders_344b)
 3A08: 3E 35       ld   a,$35
-3A0A: D7          rst  $10
+3A0A: D7          rst  $10                  ; KILL task $35 (task35_s3_boulder_collision_382b)
 3A0B: 3E 01       ld   a,$01
-3A0D: F7          rst  $30
+3A0D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3A0E: 3E AE       ld   a,$AE
-3A10: 32 0B D5    ld   ($D50B),a
+3A10: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AE
 3A13: 3E 80       ld   a,$80
-3A15: 32 3B 84    ld   ($843B),a
+3A15: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $80
 3A18: 21 64 85    ld   hl,$8564
 3A1B: CB 8E       res  1,(hl)
 3A1D: 21 B9 84    ld   hl,$84B9
@@ -7465,9 +8628,9 @@ music_sequencer_0c00:
 3A22: 11 BA 84    ld   de,$84BA
 3A25: 01 07 00    ld   bc,$0007
 3A28: ED B0       ldir
-3A2A: 21 C0 57    ld   hl,$57C0
+3A2A: 21 C0 57    ld   hl,s3_set_big_boulder_sprite_57c0  ; patch call-back $8497 -> 57C0
 3A2D: 22 97 84    ld   ($8497),hl
-3A30: 21 FF 57    ld   hl,$57FF
+3A30: 21 FF 57    ld   hl,s3_final_speed_57ff  ; patch call-back $849A -> 57FF
 3A33: 22 9A 84    ld   ($849A),hl
 3A36: 3E 05       ld   a,$05
 3A38: 32 D7 84    ld   ($84D7),a
@@ -7477,96 +8640,142 @@ music_sequencer_0c00:
 3A42: 32 DA 84    ld   ($84DA),a
 3A45: AF          xor  a
 3A46: 11 D9 84    ld   de,$84D9
-3A49: 21 52 3A    ld   hl,$3A52
+3A49: 21 52 3A    ld   hl,s3_hilltop_resume_3a52  ; patch continuation $849D -> 3A52
 3A4C: 22 9D 84    ld   ($849D),hl
-3A4F: C3 92 35    jp   $3592
+3A4F: C3 92 35    jp   s3_boulder_activate_set_3592
+
+s3_hilltop_resume_3a52:
 3A52: AF          xor  a
 3A53: 32 A1 84    ld   ($84A1),a
 3A56: 3E 3C       ld   a,$3C
-3A58: F7          rst  $30
+3A58: F7          rst  $30                  ; SLEEP 60 frames (yield)
 3A59: 3A D8 84    ld   a,($84D8)
-3A5C: CD DC 36    call $36DC
-3A5F: CC 3A 35    call z,$353A
+3A5C: CD DC 36    call test_tick_mask_a4_36dc
+3A5F: CC 3A 35    call z,s3_boulder_move_353a
 3A62: 3A A1 84    ld   a,($84A1)
 3A65: 3C          inc  a
 3A66: 3E 01       ld   a,$01
-3A68: F7          rst  $30
+3A68: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3A69: 20 EE       jr   nz,$3A59
 3A6B: 3E FF       ld   a,$FF
 3A6D: 32 92 84    ld   ($8492),a
 3A70: 3E 49       ld   a,$49
-3A72: CF          rst  $08
+3A72: CF          rst  $08                  ; SPAWN task $49 (task49_s3_final_jump_5805)
 3A73: 3E 04       ld   a,$04
-3A75: D7          rst  $10
+3A75: D7          rst  $10                  ; KILL task $04 (task04_scroll_117c)
 3A76: 3E 36       ld   a,$36
-3A78: D7          rst  $10
+3A78: D7          rst  $10                  ; KILL task $36 (task36_s3_hilltop_39f6)
 
-3B00: C3 79 3B    jp   $3B79
-3B03: C3 37 3C    jp   $3C37
-3B06: C3 94 3E    jp   $3E94
-3B09: C3 44 3F    jp   $3F44
-3B0C: C3 82 3F    jp   $3F82
-3B0F: C3 00 73    jp   $7300
-3B12: C3 30 73    jp   $7330
-3B15: C3 8D 73    jp   $738D
-3B18: C3 B7 74    jp   $74B7
-3B1B: C3 75 75    jp   $7575
-3B1E: C3 38 75    jp   $7538
-3B21: C3 03 76    jp   $7603
-3B24: C3 2A 3B    jp   $3B2A
-3B27: C3 A0 77    jp   $77A0
+;----------------------------------------------------------------------------
+; Task entry vectors of stage 4: IDs $38..$45 (in this order).
+;----------------------------------------------------------------------------
+vec_task38_3b00:
+3B00: C3 79 3B    jp   task38_s4_init_3b79
+
+vec_task39_3b03:
+3B03: C3 37 3C    jp   task39_s4_scene_3c37
+
+vec_task3a_3b06:
+3B06: C3 94 3E    jp   task3a_s4_cannibal_collision_3e94
+
+vec_task3b_3b09:
+3B09: C3 44 3F    jp   task3b_s4_rescue_check_3f44
+
+vec_task3c_3b0c:
+3B0C: C3 82 3F    jp   task3c_s4_hazard_collision_3f82
+
+vec_task3d_3b0f:
+3B0F: C3 00 73    jp   task3d_s4_dance_anim_7300
+
+vec_task3e_3b12:
+3B12: C3 30 73    jp   task3e_s4_jump_button_7330
+
+vec_task3f_3b15:
+3B15: C3 8D 73    jp   task3f_s4_jump_738d
+
+vec_task40_3b18:
+3B18: C3 B7 74    jp   task40_s4_resolve_74b7
+
+vec_task41_3b1b:
+3B1B: C3 75 75    jp   task41_s4_walk_7575
+
+vec_task42_3b1e:
+3B1E: C3 38 75    jp   task42_s4_death_anim_7538
+
+vec_task43_3b21:
+3B21: C3 03 76    jp   task43_s4_spear_7603
+
+vec_task44_3b24:
+3B24: C3 2A 3B    jp   task44_ending_3b2a
+
+vec_task45_3b27:
+3B27: C3 A0 77    jp   task45_s4_sprite_align_77a0
+
+;----------------------------------------------------------------------------
+; === TASK $44 : ENDING (after stage 4 of each round) ===
+; Loads the ending graphics (task 7, gfx ROM $7000), palette, draws the
+; scene, syncs with task 2 on event $69, text $4F90, sound $B0.
+;----------------------------------------------------------------------------
+task44_ending_3b2a:
 3B2A: 3E 01       ld   a,$01
-3B2C: F7          rst  $30
-3B2D: CD 65 77    call $7765
+3B2C: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3B2D: CD 65 77    call clear_sprites_and_bg_7765
 3B30: 21 00 70    ld   hl,$7000
 3B33: 01 00 05    ld   bc,$0500
 3B36: 3E 07       ld   a,$07
-3B38: CF          rst  $08
+3B38: CF          rst  $08                  ; SPAWN task $07 (task07_load_stage_gfx_10c0)
 3B39: 3E 07       ld   a,$07
-3B3B: E7          rst  $20
+3B3B: E7          rst  $20                  ; WAIT for event $07 (yield)
 3B3C: 3E 01       ld   a,$01
-3B3E: F7          rst  $30
-3B3F: CD 8D 77    call $778D
+3B3E: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3B3F: CD 8D 77    call ending_palette_setup_778d
 3B42: 3E 01       ld   a,$01
-3B44: F7          rst  $30
+3B44: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3B45: 21 8A C9    ld   hl,$C98A
 3B48: 11 00 5B    ld   de,$5B00
-3B4B: CD E4 02    call $02E4
-3B4E: 3E 69       ld   a,$69
-3B50: EF          rst  $28
+3B4B: CD E4 02    call vec_draw_tile_block_02e4
+3B4E: 3E 69       ld   a,$69                ; sync with task 2 (event $69)
+3B50: EF          rst  $28                  ; SIGNAL event $69
 3B51: 21 AA C6    ld   hl,$C6AA
 3B54: 11 90 4F    ld   de,$4F90
 3B57: 0E 1E       ld   c,$1E
-3B59: CD D5 02    call $02D5
+3B59: CD D5 02    call vec_print_string_slow_02d5
 3B5C: 21 8A C9    ld   hl,$C98A
 3B5F: 11 56 5B    ld   de,$5B56
-3B62: CD E4 02    call $02E4
+3B62: CD E4 02    call vec_draw_tile_block_02e4
 3B65: 3E B0       ld   a,$B0
-3B67: 32 0B D5    ld   ($D50B),a
+3B67: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $B0
 3B6A: 3E 60       ld   a,$60
-3B6C: F7          rst  $30
+3B6C: F7          rst  $30                  ; SLEEP 96 frames (yield)
 3B6D: 3E 01       ld   a,$01
-3B6F: F7          rst  $30
-3B70: 3E 69       ld   a,$69
-3B72: EF          rst  $28
+3B6F: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3B70: 3E 69       ld   a,$69                ; wait until task 2 listens (A=$FF when woken)
+3B72: EF          rst  $28                  ; SIGNAL event $69
 3B73: A7          and  a
 3B74: 28 F7       jr   z,$3B6D
-3B76: 3E 44       ld   a,$44
-3B78: D7          rst  $10
+3B76: 3E 44       ld   a,$44                ; kill myself
+3B78: D7          rst  $10                  ; KILL task $44 (task44_ending_3b2a)
+
+;----------------------------------------------------------------------------
+; === TASK $38 : STAGE 4 (CANNIBALS / RESCUE) INIT ===  in: C = round
+; Draws the scene, variables from $4EE8, sprites from $4F30, spawns $39,
+; $3E,$3B,$3C,$3D,$3A,$41,$45 (+ $43 spear thrower from round 3), dies.
+;----------------------------------------------------------------------------
+task38_s4_init_3b79:
 3B79: 3E 01       ld   a,$01
-3B7B: F7          rst  $30
+3B7B: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3B7C: 79          ld   a,c
 3B7D: 32 E0 84    ld   ($84E0),a
 3B80: F5          push af
 3B81: C5          push bc
 3B82: 3E 80       ld   a,$80
-3B84: 32 5A 83    ld   ($835A),a
+3B84: 32 5A 83    ld   (scroll_mode_835a),a
 3B87: 21 00 C8    ld   hl,$C800
 3B8A: 11 80 4D    ld   de,$4D80
-3B8D: CD E4 02    call $02E4
+3B8D: CD E4 02    call vec_draw_tile_block_02e4
 3B90: 21 E0 CA    ld   hl,$CAE0
 3B93: 11 22 4E    ld   de,$4E22
-3B96: CD E4 02    call $02E4
+3B96: CD E4 02    call vec_draw_tile_block_02e4
 3B99: 21 00 CB    ld   hl,$CB00
 3B9C: 36 3B       ld   (hl),$3B
 3B9E: 11 01 CB    ld   de,$CB01
@@ -7574,10 +8783,10 @@ music_sequencer_0c00:
 3BA4: ED B0       ldir
 3BA6: 21 A0 C8    ld   hl,$C8A0
 3BA9: 11 44 4E    ld   de,$4E44
-3BAC: CD E4 02    call $02E4
+3BAC: CD E4 02    call vec_draw_tile_block_02e4
 3BAF: 21 A8 C8    ld   hl,$C8A8
 3BB2: 11 D6 4E    ld   de,$4ED6
-3BB5: CD E4 02    call $02E4
+3BB5: CD E4 02    call vec_draw_tile_block_02e4
 3BB8: 3E C8       ld   a,$C8
 3BBA: 06 0C       ld   b,$0C
 3BBC: 21 86 CC    ld   hl,$CC86
@@ -7589,23 +8798,23 @@ music_sequencer_0c00:
 3BC9: 11 98 84    ld   de,$8498
 3BCC: 01 48 00    ld   bc,$0048
 3BCF: ED B0       ldir
-3BD1: 21 2F 3E    ld   hl,$3E2F
+3BD1: 21 2F 3E    ld   hl,s4_state0_3e2f
 3BD4: 22 D0 84    ld   ($84D0),hl
 3BD7: 22 D2 84    ld   ($84D2),hl
 3BDA: 3E 06       ld   a,$06
-3BDC: 32 00 D3    ld   ($D300),a
+3BDC: 32 00 D3    ld   (priority_d300),a
 3BDF: 21 B4 1E    ld   hl,$1EB4
 3BE2: 22 D8 84    ld   ($84D8),hl
 3BE5: 21 30 4F    ld   hl,$4F30
-3BE8: 11 BB 83    ld   de,$83BB
+3BE8: 11 BB 83    ld   de,sprite_shadow_83bb
 3BEB: 01 60 00    ld   bc,$0060
-3BEE: 3A 1B 84    ld   a,($841B)
+3BEE: 3A 1B 84    ld   a,(sprite_adjust_841b)
 3BF1: 86          add  a,(hl)
 3BF2: 12          ld   (de),a
 3BF3: 23          inc  hl
 3BF4: 13          inc  de
 3BF5: 0B          dec  bc
-3BF6: 3A 1B 84    ld   a,($841B)
+3BF6: 3A 1B 84    ld   a,(sprite_adjust_841b)
 3BF9: 86          add  a,(hl)
 3BFA: 12          ld   (de),a
 3BFB: 23          inc  hl
@@ -7615,51 +8824,62 @@ music_sequencer_0c00:
 3C00: ED A0       ldi
 3C02: EA EE 3B    jp   pe,$3BEE
 3C05: 06 F0       ld   b,$F0
-3C07: CD D8 02    call $02D8
+3C07: CD D8 02    call vec_set_video_enable_02d8
 3C0A: 3A E0 84    ld   a,($84E0)
 3C0D: FE 03       cp   $03
-3C0F: CD 1A 3C    call $3C1A
-3C12: D4 33 3C    call nc,$3C33
+3C0F: CD 1A 3C    call s4_spawn_tasks_3c1a  ; (always called)
+3C12: D4 33 3C    call nc,s4_spawn_spear_task_3c33  ; round >= 3: spear thrower
 3C15: C1          pop  bc
 3C16: F1          pop  af
-3C17: 3E 38       ld   a,$38
-3C19: D7          rst  $10
+3C17: 3E 38       ld   a,$38                ; kill myself
+3C19: D7          rst  $10                  ; KILL task $38 (task38_s4_init_3b79)
+
+s4_spawn_tasks_3c1a:
 3C1A: 3E 39       ld   a,$39
-3C1C: CF          rst  $08
+3C1C: CF          rst  $08                  ; SPAWN task $39 (task39_s4_scene_3c37)
 3C1D: 3E 3E       ld   a,$3E
-3C1F: CF          rst  $08
+3C1F: CF          rst  $08                  ; SPAWN task $3E (task3e_s4_jump_button_7330)
 3C20: 3E 3B       ld   a,$3B
-3C22: CF          rst  $08
+3C22: CF          rst  $08                  ; SPAWN task $3B (task3b_s4_rescue_check_3f44)
 3C23: 3E 3C       ld   a,$3C
-3C25: CF          rst  $08
+3C25: CF          rst  $08                  ; SPAWN task $3C (task3c_s4_hazard_collision_3f82)
 3C26: 3E 3D       ld   a,$3D
-3C28: CF          rst  $08
+3C28: CF          rst  $08                  ; SPAWN task $3D (task3d_s4_dance_anim_7300)
 3C29: 3E 3A       ld   a,$3A
-3C2B: CF          rst  $08
+3C2B: CF          rst  $08                  ; SPAWN task $3A (task3a_s4_cannibal_collision_3e94)
 3C2C: 3E 41       ld   a,$41
-3C2E: CF          rst  $08
+3C2E: CF          rst  $08                  ; SPAWN task $41 (task41_s4_walk_7575)
 3C2F: 3E 45       ld   a,$45
-3C31: CF          rst  $08
+3C31: CF          rst  $08                  ; SPAWN task $45 (task45_s4_sprite_align_77a0)
 3C32: C9          ret
+
+s4_spawn_spear_task_3c33:
 3C33: 3E 43       ld   a,$43
-3C35: CF          rst  $08
+3C35: CF          rst  $08                  ; SPAWN task $43 (task43_s4_spear_7603)
 3C36: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $39 : scene: rope/girl up & down (random turns using the R register!), cannibals, animations ===
+;----------------------------------------------------------------------------
+task39_s4_scene_3c37:
 3C37: 3E 01       ld   a,$01
-3C39: F7          rst  $30
+3C39: F7          rst  $30                  ; SLEEP 1 frame (yield)
 3C3A: 3E FF       ld   a,$FF
 3C3C: 32 1E 84    ld   ($841E),a
-3C3F: CD 4E 3C    call $3C4E
-3C42: CD D8 3C    call $3CD8
-3C45: CD F7 3C    call $3CF7
-3C48: CD 00 3E    call $3E00
-3C4B: C3 37 3C    jp   $3C37
+3C3F: CD 4E 3C    call s4_rope_move_3c4e
+3C42: CD D8 3C    call s4_rope_random_turn_3cd8
+3C45: CD F7 3C    call s4_cannibals_update_3cf7
+3C48: CD 00 3E    call s4_state_machines_3e00
+3C4B: C3 37 3C    jp   task39_s4_scene_3c37
+
+s4_rope_move_3c4e:
 3C4E: 3A 98 84    ld   a,($8498)
 3C51: 3D          dec  a
 3C52: 32 98 84    ld   ($8498),a
 3C55: C0          ret  nz
 3C56: 3A A8 84    ld   a,($84A8)
 3C59: 32 98 84    ld   ($8498),a
-3C5C: CD AA 3C    call $3CAA
+3C5C: CD AA 3C    call s4_rope_anim_3caa
 3C5F: 3A B8 84    ld   a,($84B8)
 3C62: A7          and  a
 3C63: FA 73 3C    jp   m,$3C73
@@ -7689,8 +8909,10 @@ music_sequencer_0c00:
 3C9C: 32 B8 84    ld   ($84B8),a
 3C9F: FA 5F 3C    jp   m,$3C5F
 3CA2: 3E C1       ld   a,$C1
-3CA4: 32 0B D5    ld   ($D50B),a
+3CA4: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $C1
 3CA7: C3 5F 3C    jp   $3C5F
+
+s4_rope_anim_3caa:
 3CAA: 21 9C 84    ld   hl,$849C
 3CAD: 7E          ld   a,(hl)
 3CAE: 3D          dec  a
@@ -7715,6 +8937,11 @@ music_sequencer_0c00:
 3CD4: 3E 1C       ld   a,$1C
 3CD6: 02          ld   (bc),a
 3CD7: C9          ret
+
+;----------------------------------------------------------------------------
+; Random direction change: compares the Z80 R register with $84BF (a port must provide a pseudo random value).
+;----------------------------------------------------------------------------
+s4_rope_random_turn_3cd8:
 3CD8: 3A 99 84    ld   a,($8499)
 3CDB: 3D          dec  a
 3CDC: 32 99 84    ld   ($8499),a
@@ -7723,13 +8950,15 @@ music_sequencer_0c00:
 3CE3: 32 99 84    ld   ($8499),a
 3CE6: 3A BF 84    ld   a,($84BF)
 3CE9: 47          ld   b,a
-3CEA: ED 5F       ld   a,r
+3CEA: ED 5F       ld   a,r                  ; R register used as a random number
 3CEC: B8          cp   b
 3CED: D0          ret  nc
 3CEE: 3A B8 84    ld   a,($84B8)
 3CF1: ED 44       neg
 3CF3: 32 B8 84    ld   ($84B8),a
 3CF6: C9          ret
+
+s4_cannibals_update_3cf7:
 3CF7: 21 9A 84    ld   hl,$849A
 3CFA: 7E          ld   a,(hl)
 3CFB: 3D          dec  a
@@ -7739,8 +8968,8 @@ music_sequencer_0c00:
 3D03: 77          ld   (hl),a
 3D04: 01 00 00    ld   bc,$0000
 3D07: 11 00 00    ld   de,$0000
-3D0A: CD 28 3D    call $3D28
-3D0D: CD A4 3D    call $3DA4
+3D0A: CD 28 3D    call s4_cannibal_bounce_3d28
+3D0D: CD A4 3D    call s4_cannibal1_anim_3da4
 3D10: 21 9B 84    ld   hl,$849B
 3D13: 7E          ld   a,(hl)
 3D14: 3D          dec  a
@@ -7750,43 +8979,45 @@ music_sequencer_0c00:
 3D1A: 77          ld   (hl),a
 3D1B: 01 00 00    ld   bc,$0000
 3D1E: 11 3F 0C    ld   de,$0C3F
-3D21: CD 28 3D    call $3D28
-3D24: CD D2 3D    call $3DD2
+3D21: CD 28 3D    call s4_cannibal_bounce_3d28
+3D24: CD D2 3D    call s4_cannibal2_anim_3dd2
 3D27: C9          ret
-3D28: CD 73 3D    call $3D73
+
+s4_cannibal_bounce_3d28:
+3D28: CD 73 3D    call s4_get_speed_ptr_3d73
 3D2B: 7E          ld   a,(hl)
 3D2C: A7          and  a
 3D2D: FA 44 3D    jp   m,$3D44
-3D30: CD 7D 3D    call $3D7D
+3D30: CD 7D 3D    call s4_get_sprite_ptr_3d7d
 3D33: 46          ld   b,(hl)
 3D34: 3A C3 84    ld   a,($84C3)
 3D37: 83          add  a,e
 3D38: B8          cp   b
 3D39: F5          push af
-3D3A: CD 73 3D    call $3D73
+3D3A: CD 73 3D    call s4_get_speed_ptr_3d73
 3D3D: F1          pop  af
 3D3E: FA 6C 3D    jp   m,$3D6C
 3D41: C3 55 3D    jp   $3D55
-3D44: CD 7D 3D    call $3D7D
+3D44: CD 7D 3D    call s4_get_sprite_ptr_3d7d
 3D47: 46          ld   b,(hl)
 3D48: 3A C2 84    ld   a,($84C2)
 3D4B: 83          add  a,e
 3D4C: B8          cp   b
 3D4D: F5          push af
-3D4E: CD 73 3D    call $3D73
+3D4E: CD 73 3D    call s4_get_speed_ptr_3d73
 3D51: F1          pop  af
 3D52: F2 6C 3D    jp   p,$3D6C
-3D55: CD 73 3D    call $3D73
+3D55: CD 73 3D    call s4_get_speed_ptr_3d73
 3D58: 46          ld   b,(hl)
-3D59: CD 7D 3D    call $3D7D
+3D59: CD 7D 3D    call s4_get_sprite_ptr_3d7d
 3D5C: 7E          ld   a,(hl)
 3D5D: 80          add  a,b
 3D5E: 77          ld   (hl),a
-3D5F: CD 87 3D    call $3D87
+3D5F: CD 87 3D    call hl_plus_4_3d87
 3D62: 7E          ld   a,(hl)
 3D63: 80          add  a,b
 3D64: 77          ld   (hl),a
-3D65: CD 87 3D    call $3D87
+3D65: CD 87 3D    call hl_plus_4_3d87
 3D68: 7E          ld   a,(hl)
 3D69: 80          add  a,b
 3D6A: 77          ld   (hl),a
@@ -7794,13 +9025,17 @@ music_sequencer_0c00:
 3D6C: 7E          ld   a,(hl)
 3D6D: ED 44       neg
 3D6F: 77          ld   (hl),a
-3D70: C3 28 3D    jp   $3D28
+3D70: C3 28 3D    jp   s4_cannibal_bounce_3d28
+
+s4_get_speed_ptr_3d73:
 3D73: 21 B9 84    ld   hl,$84B9
 3D76: 7A          ld   a,d
 3D77: A7          and  a
 3D78: CA 7C 3D    jp   z,$3D7C
 3D7B: 23          inc  hl
 3D7C: C9          ret
+
+s4_get_sprite_ptr_3d7d:
 3D7D: 21 C3 83    ld   hl,$83C3
 3D80: 7D          ld   a,l
 3D81: 82          add  a,d
@@ -7809,11 +9044,15 @@ music_sequencer_0c00:
 3D84: 89          adc  a,c
 3D85: 67          ld   h,a
 3D86: C9          ret
+
+hl_plus_4_3d87:
 3D87: 23          inc  hl
 3D88: 23          inc  hl
 3D89: 23          inc  hl
 3D8A: 23          inc  hl
 3D8B: C9          ret
+
+s4_anim_hold_3d8c:
 3D8C: F5          push af
 3D8D: 3D          dec  a
 3D8E: 77          ld   (hl),a
@@ -7822,9 +9061,13 @@ music_sequencer_0c00:
 3D95: DD 36 39 60 ld   (ix+$39),$60
 3D99: F1          pop  af
 3D9A: C9          ret
+
+s4_anim_clear_3d9b:
 3D9B: DD 36 38 00 ld   (ix+$38),$00
 3D9F: DD 36 39 00 ld   (ix+$39),$00
 3DA3: C9          ret
+
+s4_cannibal1_anim_3da4:
 3DA4: 21 9D 84    ld   hl,$849D
 3DA7: 7E          ld   a,(hl)
 3DA8: 3D          dec  a
@@ -7836,8 +9079,8 @@ music_sequencer_0c00:
 3DB3: 21 A1 84    ld   hl,$84A1
 3DB6: 7E          ld   a,(hl)
 3DB7: A7          and  a
-3DB8: C4 8C 3D    call nz,$3D8C
-3DBB: CC 9B 3D    call z,$3D9B
+3DB8: C4 8C 3D    call nz,s4_anim_hold_3d8c
+3DBB: CC 9B 3D    call z,s4_anim_clear_3d9b
 3DBE: 3A C9 84    ld   a,($84C9)
 3DC1: FE 27       cp   $27
 3DC3: C2 C8 3D    jp   nz,$3DC8
@@ -7848,6 +9091,8 @@ music_sequencer_0c00:
 3DCD: 3C          inc  a
 3DCE: 32 C9 84    ld   ($84C9),a
 3DD1: C9          ret
+
+s4_cannibal2_anim_3dd2:
 3DD2: 21 9E 84    ld   hl,$849E
 3DD5: 7E          ld   a,(hl)
 3DD6: 3D          dec  a
@@ -7859,8 +9104,8 @@ music_sequencer_0c00:
 3DE1: 21 A2 84    ld   hl,$84A2
 3DE4: 7E          ld   a,(hl)
 3DE5: A7          and  a
-3DE6: C4 8C 3D    call nz,$3D8C
-3DE9: CC 9B 3D    call z,$3D9B
+3DE6: C4 8C 3D    call nz,s4_anim_hold_3d8c
+3DE9: CC 9B 3D    call z,s4_anim_clear_3d9b
 3DEC: 3A CA 84    ld   a,($84CA)
 3DEF: FE 27       cp   $27
 3DF1: C2 F6 3D    jp   nz,$3DF6
@@ -7871,24 +9116,33 @@ music_sequencer_0c00:
 3DFB: 3C          inc  a
 3DFC: 32 CA 84    ld   ($84CA),a
 3DFF: C9          ret
+
+s4_state_machines_3e00:
 3E00: FD 21 D0 84 ld   iy,$84D0
 3E04: DD 2A D0 84 ld   ix,($84D0)
 3E08: 01 9F 84    ld   bc,$849F
 3E0B: 11 CB 84    ld   de,$84CB
 3E0E: 21 CE 83    ld   hl,$83CE
-3E11: CD 29 3E    call $3E29
+3E11: CD 29 3E    call s4_run_state_3e29
 3E14: FD 21 D2 84 ld   iy,$84D2
 3E18: DD 2A D2 84 ld   ix,($84D2)
 3E1C: 01 A0 84    ld   bc,$84A0
 3E1F: 11 CC 84    ld   de,$84CC
 3E22: 21 DA 83    ld   hl,$83DA
-3E25: CD 29 3E    call $3E29
+3E25: CD 29 3E    call s4_run_state_3e29
 3E28: C9          ret
+
+;----------------------------------------------------------------------------
+; Run a state machine: state pointer in (IY) -> JP (IX). Handlers store the next state address back.
+;----------------------------------------------------------------------------
+s4_run_state_3e29:
 3E29: 0A          ld   a,(bc)
 3E2A: 3D          dec  a
 3E2B: 02          ld   (bc),a
 3E2C: F0          ret  p
-3E2D: DD E9       jp   (ix)
+3E2D: DD E9       jp   (ix)                 ; jump to the current state handler
+
+s4_state0_3e2f:
 3E2F: 3A AF 84    ld   a,($84AF)
 3E32: 02          ld   (bc),a
 3E33: E5          push hl
@@ -7900,29 +9154,35 @@ music_sequencer_0c00:
 3E3D: 02          ld   (bc),a
 3E3E: C1          pop  bc
 3E3F: E1          pop  hl
-3E40: CD 7B 3E    call $3E7B
-3E43: 21 4F 3E    ld   hl,$3E4F
+3E40: CD 7B 3E    call s4_set_codes_3e7b
+3E43: 21 4F 3E    ld   hl,s4_state1_3e4f
 3E46: FD 75 00    ld   (iy+$00),l
 3E49: FD 74 01    ld   (iy+$01),h
 3E4C: C3 7A 3E    jp   $3E7A
+
+s4_state1_3e4f:
 3E4F: 3E 85       ld   a,$85
-3E51: 32 0B D5    ld   ($D50B),a
+3E51: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $85
 3E54: 3A B0 84    ld   a,($84B0)
 3E57: 02          ld   (bc),a
-3E58: CD 7B 3E    call $3E7B
-3E5B: 21 67 3E    ld   hl,$3E67
+3E58: CD 7B 3E    call s4_set_codes_3e7b
+3E5B: 21 67 3E    ld   hl,s4_state2_3e67
 3E5E: FD 75 00    ld   (iy+$00),l
 3E61: FD 74 01    ld   (iy+$01),h
 3E64: C3 7A 3E    jp   $3E7A
+
+s4_state2_3e67:
 3E67: 3A B2 84    ld   a,($84B2)
 3E6A: 02          ld   (bc),a
-3E6B: CD 7B 3E    call $3E7B
+3E6B: CD 7B 3E    call s4_set_codes_3e7b
 3E6E: 3E 1F       ld   a,$1F
 3E70: 12          ld   (de),a
-3E71: 21 2F 3E    ld   hl,$3E2F
+3E71: 21 2F 3E    ld   hl,s4_state0_3e2f
 3E74: FD 75 00    ld   (iy+$00),l
 3E77: FD 74 01    ld   (iy+$01),h
 3E7A: C9          ret
+
+s4_set_codes_3e7b:
 3E7B: 1A          ld   a,(de)
 3E7C: FE 1F       cp   $1F
 3E7E: C2 89 3E    jp   nz,$3E89
@@ -7942,9 +9202,14 @@ music_sequencer_0c00:
 3E91: 3C          inc  a
 3E92: 12          ld   (de),a
 3E93: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $3A : player vs cannibals collision -> death ($84D7 b2), spawns $40 ===
+;----------------------------------------------------------------------------
+task3a_s4_cannibal_collision_3e94:
 3E94: 3E 01       ld   a,$01
-3E96: F7          rst  $30
-3E97: DD 21 BB 83 ld   ix,$83BB
+3E96: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3E97: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 3E9B: DD 7E 08    ld   a,(ix+$08)
 3E9E: DD 46 20    ld   b,(ix+$20)
 3EA1: 90          sub  b
@@ -7954,8 +9219,8 @@ music_sequencer_0c00:
 3EA9: F2 CA 3E    jp   p,$3ECA
 3EAC: DD 7E 13    ld   a,(ix+$13)
 3EAF: FE 25       cp   $25
-3EB1: CC F9 3E    call z,$3EF9
-3EB4: C4 FC 3E    call nz,$3EFC
+3EB1: CC F9 3E    call z,s4_hit_range_high_3ef9
+3EB4: C4 FC 3E    call nz,s4_hit_range_low_3efc
 3EB7: DD 7E 09    ld   a,(ix+$09)
 3EBA: DD 46 21    ld   b,(ix+$21)
 3EBD: 90          sub  b
@@ -7973,8 +9238,8 @@ music_sequencer_0c00:
 3ED8: F2 FF 3E    jp   p,$3EFF
 3EDB: DD 7E 1F    ld   a,(ix+$1f)
 3EDE: FE 25       cp   $25
-3EE0: CC F9 3E    call z,$3EF9
-3EE3: C4 FC 3E    call nz,$3EFC
+3EE0: CC F9 3E    call z,s4_hit_range_high_3ef9
+3EE3: C4 FC 3E    call nz,s4_hit_range_low_3efc
 3EE6: DD 7E 15    ld   a,(ix+$15)
 3EE9: DD 46 21    ld   b,(ix+$21)
 3EEC: 90          sub  b
@@ -7983,13 +9248,17 @@ music_sequencer_0c00:
 3EF2: B9          cp   c
 3EF3: F2 FF 3E    jp   p,$3EFF
 3EF6: C3 02 3F    jp   $3F02
+
+s4_hit_range_high_3ef9:
 3EF9: 0E 28       ld   c,$28
 3EFB: C9          ret
+
+s4_hit_range_low_3efc:
 3EFC: 0E 1D       ld   c,$1D
 3EFE: C9          ret
-3EFF: C3 94 3E    jp   $3E94
+3EFF: C3 94 3E    jp   task3a_s4_cannibal_collision_3e94
 3F02: 3E AF       ld   a,$AF
-3F04: 32 0B D5    ld   ($D50B),a
+3F04: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AF
 3F07: 3A D7 84    ld   a,($84D7)
 3F0A: CB D7       set  2,a
 3F0C: 32 D7 84    ld   ($84D7),a
@@ -8010,19 +9279,24 @@ music_sequencer_0c00:
 3F39: 3E 00       ld   a,$00
 3F3B: 32 C6 84    ld   ($84C6),a
 3F3E: 3E 40       ld   a,$40
-3F40: CF          rst  $08
+3F40: CF          rst  $08                  ; SPAWN task $40 (task40_s4_resolve_74b7)
 3F41: 3E 3A       ld   a,$3A
-3F43: D7          rst  $10
+3F43: D7          rst  $10                  ; KILL task $3A (task3a_s4_cannibal_collision_3e94)
+
+;----------------------------------------------------------------------------
+; === TASK $3B : player reaches the girl -> RESCUE ($84C6=$FF), spawns $40 ===
+;----------------------------------------------------------------------------
+task3b_s4_rescue_check_3f44:
 3F44: 3E 01       ld   a,$01
-3F46: F7          rst  $30
-3F47: DD 21 BB 83 ld   ix,$83BB
+3F46: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3F47: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 3F4B: DD 46 04    ld   b,(ix+$04)
 3F4E: DD 7E 24    ld   a,(ix+$24)
 3F51: 90          sub  b
 3F52: F2 57 3F    jp   p,$3F57
 3F55: ED 44       neg
 3F57: FE 0D       cp   $0D
-3F59: F2 44 3F    jp   p,$3F44
+3F59: F2 44 3F    jp   p,task3b_s4_rescue_check_3f44
 3F5C: DD 7E 25    ld   a,(ix+$25)
 3F5F: DD 46 05    ld   b,(ix+$05)
 3F62: 90          sub  b
@@ -8033,30 +9307,35 @@ music_sequencer_0c00:
 3F6D: DD 7E 25    ld   a,(ix+$25)
 3F70: DD 46 05    ld   b,(ix+$05)
 3F73: 90          sub  b
-3F74: DA 44 3F    jp   c,$3F44
+3F74: DA 44 3F    jp   c,task3b_s4_rescue_check_3f44
 3F77: 3E FF       ld   a,$FF
 3F79: 32 C6 84    ld   ($84C6),a
 3F7C: 3E 40       ld   a,$40
-3F7E: CF          rst  $08
+3F7E: CF          rst  $08                  ; SPAWN task $40 (task40_s4_resolve_74b7)
 3F7F: 3E 3B       ld   a,$3B
-3F81: D7          rst  $10
+3F81: D7          rst  $10                  ; KILL task $3B (task3b_s4_rescue_check_3f44)
+
+;----------------------------------------------------------------------------
+; === TASK $3C : player vs hazard collision -> death ($84D7 b1), spawns $40 ===
+;----------------------------------------------------------------------------
+task3c_s4_hazard_collision_3f82:
 3F82: 3E 01       ld   a,$01
-3F84: F7          rst  $30
-3F85: DD 21 BB 83 ld   ix,$83BB
+3F84: F7          rst  $30                  ; SLEEP 1 frame (yield)
+3F85: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 3F89: DD 7E 20    ld   a,(ix+$20)
 3F8C: DD 46 30    ld   b,(ix+$30)
 3F8F: 90          sub  b
 3F90: F2 95 3F    jp   p,$3F95
 3F93: ED 44       neg
 3F95: FE 1D       cp   $1D
-3F97: F2 82 3F    jp   p,$3F82
+3F97: F2 82 3F    jp   p,task3c_s4_hazard_collision_3f82
 3F9A: DD 7E 21    ld   a,(ix+$21)
 3F9D: DD 46 35    ld   b,(ix+$35)
 3FA0: 90          sub  b
 3FA1: F2 A6 3F    jp   p,$3FA6
 3FA4: ED 44       neg
 3FA6: FE 1E       cp   $1E
-3FA8: F2 82 3F    jp   p,$3F82
+3FA8: F2 82 3F    jp   p,task3c_s4_hazard_collision_3f82
 3FAB: 3A D7 84    ld   a,($84D7)
 3FAE: CB CF       set  1,a
 3FB0: 32 D7 84    ld   ($84D7),a
@@ -8077,11 +9356,14 @@ music_sequencer_0c00:
 3FDD: AF          xor  a
 3FDE: 32 C6 84    ld   ($84C6),a
 3FE1: 3E 40       ld   a,$40
-3FE3: CF          rst  $08
+3FE3: CF          rst  $08                  ; SPAWN task $40 (task40_s4_resolve_74b7)
 3FE4: 3E 3C       ld   a,$3C
-3FE6: D7          rst  $10
+3FE6: D7          rst  $10                  ; KILL task $3C (task3c_s4_hazard_collision_3f82)
 
-
+;----------------------------------------------------------------------------
+; Stage 3 final big boulder: 4 sprites (call-back via $8497).
+;----------------------------------------------------------------------------
+s3_set_big_boulder_sprite_57c0:
 57C0: E5          push hl
 57C1: 67          ld   h,a
 57C2: 2E 04       ld   l,$04
@@ -8092,7 +9374,7 @@ music_sequencer_0c00:
 57CA: 3E FF       ld   a,$FF
 57CC: 32 A1 84    ld   ($84A1),a
 57CF: 3E 00       ld   a,$00
-57D1: CD 5E 36    call $365E
+57D1: CD 5E 36    call set_object_and_sprite_365e
 57D4: E5          push hl
 57D5: 21 10 00    ld   hl,$0010
 57D8: 19          add  hl,de
@@ -8101,7 +9383,7 @@ music_sequencer_0c00:
 57DB: E1          pop  hl
 57DC: 24          inc  h
 57DD: 3C          inc  a
-57DE: CD 5E 36    call $365E
+57DE: CD 5E 36    call set_object_and_sprite_365e
 57E1: E5          push hl
 57E2: 21 10 00    ld   hl,$0010
 57E5: 09          add  hl,bc
@@ -8110,7 +9392,7 @@ music_sequencer_0c00:
 57E8: E1          pop  hl
 57E9: 24          inc  h
 57EA: 3C          inc  a
-57EB: CD 5E 36    call $365E
+57EB: CD 5E 36    call set_object_and_sprite_365e
 57EE: E5          push hl
 57EF: 21 F0 FF    ld   hl,$FFF0
 57F2: 19          add  hl,de
@@ -8119,26 +9401,32 @@ music_sequencer_0c00:
 57F5: E1          pop  hl
 57F6: 24          inc  h
 57F7: 3C          inc  a
-57F8: CD 5E 36    call $365E
+57F8: CD 5E 36    call set_object_and_sprite_365e
 57FB: F1          pop  af
 57FC: 08          ex   af,af'
 57FD: E1          pop  hl
 57FE: C9          ret
 
+s3_final_speed_57ff:
 57FF: 3E 01       ld   a,$01
-5801: 32 45 83    ld   ($8345),a
+5801: 32 45 83    ld   (scroll_speed_8345),a
 5804: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $49 : stage 3 final jump over the big boulder (+500), then spawns $29 (stage end) ===
+;----------------------------------------------------------------------------
+task49_s3_final_jump_5805:
 5805: 21 01 82    ld   hl,$8201
 5808: 22 BD 84    ld   ($84BD),hl
 580B: 3E 01       ld   a,$01
-580D: F7          rst  $30
+580D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 580E: 3A 64 85    ld   a,($8564)
 5811: CB 47       bit  0,a
 5813: 20 F6       jr   nz,$580B
-5815: 21 1C 02    ld   hl,$021C
+5815: 21 1C 02    ld   hl,$021C             ; x limit
 5818: 22 71 85    ld   ($8571),hl
 581B: 3E 01       ld   a,$01
-581D: F7          rst  $30
+581D: F7          rst  $30                  ; SLEEP 1 frame (yield)
 581E: 3A A6 84    ld   a,($84A6)
 5821: FE 0B       cp   $0B
 5823: 30 07       jr   nc,$582C
@@ -8150,78 +9438,92 @@ music_sequencer_0c00:
 5832: 3E 01       ld   a,$01
 5834: 32 64 85    ld   ($8564),a
 5837: 3E 4A       ld   a,$4A
-5839: D7          rst  $10
+5839: D7          rst  $10                  ; KILL task $4A (task4a_s3_player_sfx_3963)
 583A: 3E 98       ld   a,$98
-583C: 32 0B D5    ld   ($D50B),a
+583C: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $98
 583F: 3E 01       ld   a,$01
-5841: F7          rst  $30
+5841: F7          rst  $30                  ; SLEEP 1 frame (yield)
 5842: 3A 64 85    ld   a,($8564)
 5845: CB 47       bit  0,a
 5847: 20 F6       jr   nz,$583F
 5849: 06 32       ld   b,$32
-584B: 3A 74 81    ld   a,($8174)
+584B: 3A 74 81    ld   a,(pending_score_ticks_8174)
 584E: 80          add  a,b
-584F: 32 74 81    ld   ($8174),a
+584F: 32 74 81    ld   (pending_score_ticks_8174),a
 5852: 3E 33       ld   a,$33
-5854: D7          rst  $10
+5854: D7          rst  $10                  ; KILL task $33 (task33_s3_player_316a)
 5855: 3E 34       ld   a,$34
-5857: D7          rst  $10
+5857: D7          rst  $10                  ; KILL task $34 (task34_s3_hill_scroll_3401)
 5858: 3E 2F       ld   a,$2F
 585A: 32 BE 83    ld   ($83BE),a
 585D: 3E 2E       ld   a,$2E
 585F: 32 C2 83    ld   ($83C2),a
 5862: 3E 81       ld   a,$81
-5864: 32 0B D5    ld   ($D50B),a
+5864: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $81
 5867: 3E 3C       ld   a,$3C
-5869: F7          rst  $30
+5869: F7          rst  $30                  ; SLEEP 60 frames (yield)
 586A: 3E 29       ld   a,$29
-586C: CF          rst  $08
+586C: CF          rst  $08                  ; SPAWN task $29 (task29_s3_stage_end_33ba)
 586D: 3E 49       ld   a,$49
-586F: D7          rst  $10
+586F: D7          rst  $10                  ; KILL task $49 (task49_s3_final_jump_5805)
+
+;----------------------------------------------------------------------------
+; Death scene loop (never returns, the task is killed by task 2's RST 18):
+; sound $82, layers 2/3 vertical scroll driven by the script $3A79.
+;----------------------------------------------------------------------------
+death_scroll_loop_5870:
 5870: 3E 82       ld   a,$82
-5872: 32 0B D5    ld   ($D50B),a
+5872: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $82
 5875: 21 79 3A    ld   hl,$3A79
 5878: 22 90 84    ld   ($8490),hl
-587B: CD 8A 37    call $378A
+587B: CD 8A 37    call s3_hill_script_step_378a
 587E: 3A 93 84    ld   a,($8493)
 5881: D6 FE       sub  $FE
 5883: 32 FC 82    ld   ($82FC),a
 5886: 32 FE 82    ld   ($82FE),a
 5889: C6 10       add  a,$10
 588B: 32 FA 82    ld   ($82FA),a
-588E: CD E7 02    call $02E7
+588E: CD E7 02    call vec_compute_scroll_regs_02e7  ; compute_scroll_regs
 5891: 3E 01       ld   a,$01
-5893: F7          rst  $30
+5893: F7          rst  $30                  ; SLEEP 1 frame (yield)
 5894: C3 7B 58    jp   $587B
 
-
-7300: 3E 01       ld   a,$01                                          
-7302: F7          rst  $30                                            
-7303: DD 21 BB 83 ld   ix,$83BB                                       
+;----------------------------------------------------------------------------
+; === TASK $3D : cannibal dance animation ===
+;----------------------------------------------------------------------------
+task3d_s4_dance_anim_7300:
+7300: 3E 01       ld   a,$01
+7302: F7          rst  $30                  ; SLEEP 1 frame (yield)
+7303: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 7307: DD 36 2B 28 ld   (ix+$2b),$28
 730B: DD 36 2F 29 ld   (ix+$2f),$29
 730F: DD 36 33 2A ld   (ix+$33),$2A
 7313: DD 36 37 2B ld   (ix+$37),$2B
 7317: 3E 14       ld   a,$14
-7319: F7          rst  $30
+7319: F7          rst  $30                  ; SLEEP 20 frames (yield)
 731A: DD 36 2B 2C ld   (ix+$2b),$2C
 731E: DD 36 2F 2D ld   (ix+$2f),$2D
 7322: DD 36 33 2E ld   (ix+$33),$2E
 7326: DD 36 37 2F ld   (ix+$37),$2F
 732A: 3E 14       ld   a,$14
-732C: F7          rst  $30
-732D: C3 00 73    jp   $7300
+732C: F7          rst  $30                  ; SLEEP 20 frames (yield)
+732D: C3 00 73    jp   task3d_s4_dance_anim_7300
+
+;----------------------------------------------------------------------------
+; === TASK $3E : stage 4 jump button -> path $77F3/$782B/$7863, spawns $3F, kills $41 and itself ===
+;----------------------------------------------------------------------------
+task3e_s4_jump_button_7330:
 7330: 3E 01       ld   a,$01
-7332: F7          rst  $30
+7332: F7          rst  $30                  ; SLEEP 1 frame (yield)
 7333: AF          xor  a
 7334: 32 D6 84    ld   ($84D6),a
-7337: 3A D8 81    ld   a,($81D8)
+7337: 3A D8 81    ld   a,(joystick_input_81d8)
 733A: CB 67       bit  4,a
 733C: C2 84 73    jp   nz,$7384
 733F: 3A C4 84    ld   a,($84C4)
 7342: CB 67       bit  4,a
 7344: CA 84 73    jp   z,$7384
-7347: 3A D8 81    ld   a,($81D8)
+7347: 3A D8 81    ld   a,(joystick_input_81d8)
 734A: 32 C4 84    ld   ($84C4),a
 734D: CB 47       bit  0,a
 734F: 20 06       jr   nz,$7357
@@ -8235,25 +9537,30 @@ music_sequencer_0c00:
 7364: 22 D4 84    ld   ($84D4),hl
 7367: 3E 01       ld   a,$01
 7369: 32 C5 84    ld   ($84C5),a
-736C: DD 21 BB 83 ld   ix,$83BB
+736C: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 7370: DD 7E 20    ld   a,(ix+$20)
 7373: 32 A3 84    ld   ($84A3),a
 7376: 3E 96       ld   a,$96
-7378: 32 0B D5    ld   ($D50B),a
+7378: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $96
 737B: 3E 3F       ld   a,$3F
-737D: CF          rst  $08
+737D: CF          rst  $08                  ; SPAWN task $3F (task3f_s4_jump_738d)
 737E: 3E 41       ld   a,$41
-7380: D7          rst  $10
+7380: D7          rst  $10                  ; KILL task $41 (task41_s4_walk_7575)
 7381: 3E 3E       ld   a,$3E
-7383: D7          rst  $10
-7384: 3A D8 81    ld   a,($81D8)
+7383: D7          rst  $10                  ; KILL task $3E (task3e_s4_jump_button_7330)
+7384: 3A D8 81    ld   a,(joystick_input_81d8)
 7387: 32 C4 84    ld   ($84C4),a
-738A: C3 30 73    jp   $7330
+738A: C3 30 73    jp   task3e_s4_jump_button_7330
+
+;----------------------------------------------------------------------------
+; === TASK $3F : stage 4 jump: follows the path, +100 when jumping over a cannibal, respawns $3E/$41 ===
+;----------------------------------------------------------------------------
+task3f_s4_jump_738d:
 738D: 3E 01       ld   a,$01
-738F: F7          rst  $30
+738F: F7          rst  $30                  ; SLEEP 1 frame (yield)
 7390: 3E FF       ld   a,$FF
 7392: 32 D6 84    ld   ($84D6),a
-7395: DD 21 BB 83 ld   ix,$83BB
+7395: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 7399: 2A D4 84    ld   hl,($84D4)
 739C: 46          ld   b,(hl)
 739D: 23          inc  hl
@@ -8277,7 +9584,7 @@ music_sequencer_0c00:
 73BD: DD 77 21    ld   (ix+$21),a
 73C0: C6 10       add  a,$10
 73C2: DD 77 25    ld   (ix+$25),a
-73C5: C3 8D 73    jp   $738D
+73C5: C3 8D 73    jp   task3f_s4_jump_738d
 73C8: DD 77 20    ld   (ix+$20),a
 73CB: DD 77 24    ld   (ix+$24),a
 73CE: FE 18       cp   $18
@@ -8300,9 +9607,9 @@ music_sequencer_0c00:
 7401: AF          xor  a
 7402: 32 C6 84    ld   ($84C6),a
 7405: 3E 40       ld   a,$40
-7407: CF          rst  $08
+7407: CF          rst  $08                  ; SPAWN task $40 (task40_s4_resolve_74b7)
 7408: 3E 3F       ld   a,$3F
-740A: D7          rst  $10
+740A: D7          rst  $10                  ; KILL task $3F (task3f_s4_jump_738d)
 740B: DD 7E 21    ld   a,(ix+$21)
 740E: 81          add  a,c
 740F: FE 2E       cp   $2E
@@ -8335,11 +9642,11 @@ music_sequencer_0c00:
 7447: 2B          dec  hl
 7448: DA 5E 74    jp   c,$745E
 744B: 3E 82       ld   a,$82
-744D: 32 3B 84    ld   ($843B),a
+744D: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $82
 7450: 06 0A       ld   b,$0A
-7452: 3A 74 81    ld   a,($8174)
+7452: 3A 74 81    ld   a,(pending_score_ticks_8174)
 7455: 80          add  a,b
-7456: 32 74 81    ld   ($8174),a
+7456: 32 74 81    ld   (pending_score_ticks_8174),a
 7459: 3E 02       ld   a,$02
 745B: 32 A1 84    ld   ($84A1),a
 745E: DD 7E 14    ld   a,(ix+$14)
@@ -8352,21 +9659,21 @@ music_sequencer_0c00:
 746D: BE          cp   (hl)
 746E: DA 84 74    jp   c,$7484
 7471: 3E 82       ld   a,$82
-7473: 32 3B 84    ld   ($843B),a
+7473: 32 3B 84    ld   (ay0_sfx_request_843b),a  ; AY#0 effect request $82
 7476: 06 0A       ld   b,$0A
-7478: 3A 74 81    ld   a,($8174)
+7478: 3A 74 81    ld   a,(pending_score_ticks_8174)
 747B: 80          add  a,b
-747C: 32 74 81    ld   ($8174),a
+747C: 32 74 81    ld   (pending_score_ticks_8174),a
 747F: 3E 01       ld   a,$01
 7481: 32 A2 84    ld   ($84A2),a
 7484: DD 36 21 30 ld   (ix+$21),$30
 7488: DD 36 25 40 ld   (ix+$25),$40
 748C: 3E 3E       ld   a,$3E
-748E: CF          rst  $08
+748E: CF          rst  $08                  ; SPAWN task $3E (task3e_s4_jump_button_7330)
 748F: 3E 41       ld   a,$41
-7491: CF          rst  $08
+7491: CF          rst  $08                  ; SPAWN task $41 (task41_s4_walk_7575)
 7492: 3E 3F       ld   a,$3F
-7494: D7          rst  $10
+7494: D7          rst  $10                  ; KILL task $3F (task3f_s4_jump_738d)
 7495: 47          ld   b,a
 7496: 3A D7 84    ld   a,($84D7)
 7499: A7          and  a
@@ -8383,27 +9690,34 @@ music_sequencer_0c00:
 74AF: 23          inc  hl
 74B0: 7E          ld   a,(hl)
 74B1: 32 C5 84    ld   ($84C5),a
-74B4: C3 8D 73    jp   $738D
+74B4: C3 8D 73    jp   task3f_s4_jump_738d
+
+;----------------------------------------------------------------------------
+; === TASK $40 : STAGE 4 RESOLUTION === kills the stage tasks. Rescue:
+; heart animation, +1000, $8434=0, event 0. Otherwise: spawns $42 (death)
+; and the death scroll loop.
+;----------------------------------------------------------------------------
+task40_s4_resolve_74b7:
 74B7: 3E 01       ld   a,$01
-74B9: F7          rst  $30
+74B9: F7          rst  $30                  ; SLEEP 1 frame (yield)
 74BA: 3E 39       ld   a,$39
-74BC: D7          rst  $10
+74BC: D7          rst  $10                  ; KILL task $39 (task39_s4_scene_3c37)
 74BD: 3E 3A       ld   a,$3A
-74BF: D7          rst  $10
+74BF: D7          rst  $10                  ; KILL task $3A (task3a_s4_cannibal_collision_3e94)
 74C0: 3E 3B       ld   a,$3B
-74C2: D7          rst  $10
+74C2: D7          rst  $10                  ; KILL task $3B (task3b_s4_rescue_check_3f44)
 74C3: 3E 3C       ld   a,$3C
-74C5: D7          rst  $10
+74C5: D7          rst  $10                  ; KILL task $3C (task3c_s4_hazard_collision_3f82)
 74C6: 3E 3D       ld   a,$3D
-74C8: D7          rst  $10
+74C8: D7          rst  $10                  ; KILL task $3D (task3d_s4_dance_anim_7300)
 74C9: 3E 3E       ld   a,$3E
-74CB: D7          rst  $10
+74CB: D7          rst  $10                  ; KILL task $3E (task3e_s4_jump_button_7330)
 74CC: 3E 3F       ld   a,$3F
-74CE: D7          rst  $10
+74CE: D7          rst  $10                  ; KILL task $3F (task3f_s4_jump_738d)
 74CF: 3E 41       ld   a,$41
-74D1: D7          rst  $10
+74D1: D7          rst  $10                  ; KILL task $41 (task41_s4_walk_7575)
 74D2: 3E 43       ld   a,$43
-74D4: D7          rst  $10
+74D4: D7          rst  $10                  ; KILL task $43 (task43_s4_spear_7603)
 74D5: 3A D7 84    ld   a,($84D7)
 74D8: A7          and  a
 74D9: C2 32 75    jp   nz,$7532
@@ -8411,10 +9725,10 @@ music_sequencer_0c00:
 74DF: A7          and  a
 74E0: CA 32 75    jp   z,$7532
 74E3: 3E A0       ld   a,$A0
-74E5: 32 0B D5    ld   ($D50B),a
+74E5: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $A0
 74E8: 3E 9A       ld   a,$9A
-74EA: 32 0B D5    ld   ($D50B),a
-74ED: DD 21 BB 83 ld   ix,$83BB
+74EA: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $9A
+74ED: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 74F1: DD 36 3B 30 ld   (ix+$3b),$30
 74F5: DD 7E 24    ld   a,(ix+$24)
 74F8: DD 77 38    ld   (ix+$38),a
@@ -8422,34 +9736,39 @@ music_sequencer_0c00:
 74FE: C6 20       add  a,$20
 7500: DD 77 39    ld   (ix+$39),a
 7503: 06 64       ld   b,$64
-7505: 3A 74 81    ld   a,($8174)
+7505: 3A 74 81    ld   a,(pending_score_ticks_8174)
 7508: 80          add  a,b
-7509: 32 74 81    ld   ($8174),a
+7509: 32 74 81    ld   (pending_score_ticks_8174),a
 750C: 06 03       ld   b,$03
 750E: 3E 1E       ld   a,$1E
-7510: F7          rst  $30
+7510: F7          rst  $30                  ; SLEEP 30 frames (yield)
 7511: DD 36 3B 31 ld   (ix+$3b),$31
 7515: 3E 1E       ld   a,$1E
-7517: F7          rst  $30
+7517: F7          rst  $30                  ; SLEEP 30 frames (yield)
 7518: DD 36 3B 30 ld   (ix+$3b),$30
 751C: 10 F0       djnz $750E
 751E: 3E 1E       ld   a,$1E
-7520: F7          rst  $30
+7520: F7          rst  $30                  ; SLEEP 30 frames (yield)
 7521: 3E FF       ld   a,$FF
-7523: 32 5A 83    ld   ($835A),a
+7523: 32 5A 83    ld   (scroll_mode_835a),a
 7526: 3E 00       ld   a,$00
-7528: 32 34 84    ld   ($8434),a
+7528: 32 34 84    ld   (player_died_8434),a
 752B: 3E 00       ld   a,$00
-752D: EF          rst  $28
-752E: D9          exx
+752D: EF          rst  $28                  ; SIGNAL event $00 - event 0 : stage finished
+752E: D9          exx                       ; generic 'kill myself'
 752F: 79          ld   a,c
 7530: D9          exx
-7531: D7          rst  $10
+7531: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
 7532: 3E 42       ld   a,$42
-7534: CF          rst  $08
-7535: C3 30 30    jp   $3030
+7534: CF          rst  $08                  ; SPAWN task $42 (task42_s4_death_anim_7538)
+7535: C3 30 30    jp   vector_death_scroll_3030  ; -> death scroll loop
+
+;----------------------------------------------------------------------------
+; === TASK $42 : stage 4 death animation, $8434=$FF, event 0 ===
+;----------------------------------------------------------------------------
+task42_s4_death_anim_7538:
 7538: 3E 28       ld   a,$28
-753A: F7          rst  $30
+753A: F7          rst  $30                  ; SLEEP 40 frames (yield)
 753B: 3A D7 84    ld   a,($84D7)
 753E: CB 5F       bit  3,a
 7540: CA 64 75    jp   z,$7564
@@ -8462,29 +9781,34 @@ music_sequencer_0c00:
 754E: FE 06       cp   $06
 7550: C2 58 75    jp   nz,$7558
 7553: 3E B8       ld   a,$B8
-7555: 32 0B D5    ld   ($D50B),a
+7555: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $B8
 7558: DD 74 53    ld   (ix+$53),h
 755B: DD 75 57    ld   (ix+$57),l
 755E: EB          ex   de,hl
 755F: 3E 1E       ld   a,$1E
-7561: F7          rst  $30
+7561: F7          rst  $30                  ; SLEEP 30 frames (yield)
 7562: 10 E9       djnz $754D
 7564: 3E FF       ld   a,$FF
-7566: 32 5A 83    ld   ($835A),a
+7566: 32 5A 83    ld   (scroll_mode_835a),a
 7569: 3E FF       ld   a,$FF
-756B: 32 34 84    ld   ($8434),a
+756B: 32 34 84    ld   (player_died_8434),a
 756E: 3E 00       ld   a,$00
-7570: EF          rst  $28
-7571: D9          exx
+7570: EF          rst  $28                  ; SIGNAL event $00 - event 0 : life lost
+7571: D9          exx                       ; generic 'kill myself'
 7572: 79          ld   a,c
 7573: D9          exx
-7574: D7          rst  $10
+7574: D7          rst  $10                  ; KILL MYSELF (A = C' = own task ID)
+
+;----------------------------------------------------------------------------
+; === TASK $41 : stage 4 walk left/right (sound $9B) ===
+;----------------------------------------------------------------------------
+task41_s4_walk_7575:
 7575: 3E 01       ld   a,$01
-7577: F7          rst  $30
-7578: DD 21 BB 83 ld   ix,$83BB
-757C: 3A D8 81    ld   a,($81D8)
+7577: F7          rst  $30                  ; SLEEP 1 frame (yield)
+7578: DD 21 BB 83 ld   ix,sprite_shadow_83bb
+757C: 3A D8 81    ld   a,(joystick_input_81d8)
 757F: CB 5F       bit  3,a
-7581: CA 75 75    jp   z,$7575
+7581: CA 75 75    jp   z,task41_s4_walk_7575
 7584: CB 47       bit  0,a
 7586: CA 9C 75    jp   z,$759C
 7589: CB 4F       bit  1,a
@@ -8492,10 +9816,10 @@ music_sequencer_0c00:
 758E: DD 36 22 00 ld   (ix+$22),$00
 7592: DD 36 26 00 ld   (ix+$26),$00
 7596: 3E 03       ld   a,$03
-7598: F7          rst  $30
-7599: C3 75 75    jp   $7575
+7598: F7          rst  $30                  ; SLEEP 3 frames (yield)
+7599: C3 75 75    jp   task41_s4_walk_7575
 759C: 3E 9B       ld   a,$9B
-759E: 32 0B D5    ld   ($D50B),a
+759E: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $9B
 75A1: DD 7E 20    ld   a,(ix+$20)
 75A4: C6 FD       add  a,$FD
 75A6: DD 77 20    ld   (ix+$20),a
@@ -8518,7 +9842,7 @@ music_sequencer_0c00:
 75D3: D2 96 75    jp   nc,$7596
 75D6: F5          push af
 75D7: 3E 9B       ld   a,$9B
-75D9: 32 0B D5    ld   ($D50B),a
+75D9: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $9B
 75DC: F1          pop  af
 75DD: DD 77 20    ld   (ix+$20),a
 75E0: DD 77 24    ld   (ix+$24),a
@@ -8534,9 +9858,14 @@ music_sequencer_0c00:
 75F8: DD 36 22 01 ld   (ix+$22),$01
 75FC: DD 36 26 01 ld   (ix+$26),$01
 7600: C3 96 75    jp   $7596
+
+;----------------------------------------------------------------------------
+; === TASK $43 : spear thrower (round >= 3): throw timing $1EB4 table, spear flight, hit -> death ===
+;----------------------------------------------------------------------------
+task43_s4_spear_7603:
 7603: 3E 01       ld   a,$01
-7605: F7          rst  $30
-7606: DD 21 BB 83 ld   ix,$83BB
+7605: F7          rst  $30                  ; SLEEP 1 frame (yield)
+7606: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 760A: 2A D8 84    ld   hl,($84D8)
 760D: 11 D2 1E    ld   de,$1ED2
 7610: ED 52       sbc  hl,de
@@ -8551,13 +9880,13 @@ music_sequencer_0c00:
 7622: 4E          ld   c,(hl)
 7623: 23          inc  hl
 7624: 22 D8 84    ld   ($84D8),hl
-7627: F7          rst  $30
+7627: F7          rst  $30                  ; SLEEP A frames (yield)
 7628: 78          ld   a,b
-7629: F7          rst  $30
+7629: F7          rst  $30                  ; SLEEP A frames (yield)
 762A: 79          ld   a,c
-762B: F7          rst  $30
+762B: F7          rst  $30                  ; SLEEP A frames (yield)
 762C: 3E C2       ld   a,$C2
-762E: 32 0B D5    ld   ($D50B),a
+762E: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $C2
 7631: DD 36 50 0D ld   (ix+$50),$0D
 7635: DD 36 51 A2 ld   (ix+$51),$A2
 7639: DD 36 54 0D ld   (ix+$54),$0D
@@ -8566,26 +9895,26 @@ music_sequencer_0c00:
 7643: DD 36 53 01 ld   (ix+$53),$01
 7647: DD 36 57 00 ld   (ix+$57),$00
 764B: 3E 3C       ld   a,$3C
-764D: F7          rst  $30
+764D: F7          rst  $30                  ; SLEEP 60 frames (yield)
 764E: DD 7E 20    ld   a,(ix+$20)
 7651: FE D0       cp   $D0
 7653: DA 61 76    jp   c,$7661
 7656: FE D4       cp   $D4
-7658: D4 55 77    call nc,$7755
-765B: DC 59 77    call c,$7759
+7658: D4 55 77    call nc,spear_path_a_7755
+765B: DC 59 77    call c,spear_path_b_7759
 765E: C3 69 76    jp   $7669
 7661: FE A0       cp   $A0
-7663: D4 5D 77    call nc,$775D
-7666: DC 61 77    call c,$7761
+7663: D4 5D 77    call nc,spear_path_c_775d
+7666: DC 61 77    call c,spear_path_d_7761
 7669: DD 36 53 03 ld   (ix+$53),$03
 766D: DD 36 57 02 ld   (ix+$57),$02
 7671: 3E BE       ld   a,$BE
-7673: 32 0B D5    ld   ($D50B),a
+7673: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $BE
 7676: DD 36 5C 1D ld   (ix+$5c),$1D
 767A: DD 36 5D B2 ld   (ix+$5d),$B2
 767E: DD 36 5F 3B ld   (ix+$5f),$3B
 7682: 3E 01       ld   a,$01
-7684: F7          rst  $30
+7684: F7          rst  $30                  ; SLEEP 1 frame (yield)
 7685: 46          ld   b,(hl)
 7686: 23          inc  hl
 7687: 4E          ld   c,(hl)
@@ -8598,7 +9927,7 @@ music_sequencer_0c00:
 768E: 1D          dec  e
 768F: CA 19 77    jp   z,$7719
 7692: 3E 01       ld   a,$01
-7694: F7          rst  $30
+7694: F7          rst  $30                  ; SLEEP 1 frame (yield)
 7695: DD 7E 5C    ld   a,(ix+$5c)
 7698: 80          add  a,b
 7699: DD 77 5C    ld   (ix+$5c),a
@@ -8620,7 +9949,7 @@ music_sequencer_0c00:
 76C3: DD BE 5D    cp   (ix+$5d)
 76C6: D2 12 77    jp   nc,$7712
 76C9: 3E AF       ld   a,$AF
-76CB: 32 0B D5    ld   ($D50B),a
+76CB: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $AF
 76CE: 3A D7 84    ld   a,($84D7)
 76D1: CB DF       set  3,a
 76D3: 32 D7 84    ld   ($84D7),a
@@ -8641,11 +9970,11 @@ music_sequencer_0c00:
 7700: AF          xor  a
 7701: 32 C6 84    ld   ($84C6),a
 7704: 3E 40       ld   a,$40
-7706: CF          rst  $08
+7706: CF          rst  $08                  ; SPAWN task $40 (task40_s4_resolve_74b7)
 7707: DD 36 5C 00 ld   (ix+$5c),$00
 770B: DD 36 5D 00 ld   (ix+$5d),$00
 770F: 3E 43       ld   a,$43
-7711: D7          rst  $10
+7711: D7          rst  $10                  ; KILL task $43 (task43_s4_spear_7603)
 7712: 15          dec  d
 7713: C2 92 76    jp   nz,$7692
 7716: C3 82 76    jp   $7682
@@ -8660,27 +9989,40 @@ music_sequencer_0c00:
 772C: FE 08       cp   $08
 772E: C2 36 77    jp   nz,$7736
 7731: 3E C3       ld   a,$C3
-7733: 32 0B D5    ld   ($D50B),a
+7733: 32 0B D5    ld   (sound_cmd_d50b),a   ; sound CPU command $C3
 7736: DD 74 53    ld   (ix+$53),h
 7739: DD 75 57    ld   (ix+$57),l
 773C: EB          ex   de,hl
 773D: 3E 1E       ld   a,$1E
-773F: F7          rst  $30
+773F: F7          rst  $30                  ; SLEEP 30 frames (yield)
 7740: 10 E9       djnz $772B
 7742: DD 36 50 00 ld   (ix+$50),$00
 7746: DD 36 51 00 ld   (ix+$51),$00
 774A: DD 36 54 00 ld   (ix+$54),$00
 774E: DD 36 55 00 ld   (ix+$55),$00
-7752: C3 03 76    jp   $7603
+7752: C3 03 76    jp   task43_s4_spear_7603
+
+spear_path_a_7755:
 7755: 21 90 1E    ld   hl,$1E90
 7758: C9          ret
+
+spear_path_b_7759:
 7759: 21 68 1E    ld   hl,$1E68
 775C: C9          ret
+
+spear_path_c_775d:
 775D: 21 3C 1E    ld   hl,$1E3C
 7760: C9          ret
+
+spear_path_d_7761:
 7761: 21 10 1E    ld   hl,$1E10
 7764: C9          ret
-7765: 21 BB 83    ld   hl,$83BB
+
+;----------------------------------------------------------------------------
+; Hide all sprites, clear layers 2 and 3.
+;----------------------------------------------------------------------------
+clear_sprites_and_bg_7765:
+7765: 21 BB 83    ld   hl,sprite_shadow_83bb
 7768: 36 FF       ld   (hl),$FF
 776A: 11 BC 83    ld   de,$83BC
 776D: 01 5F 00    ld   bc,$005F
@@ -8696,22 +10038,32 @@ music_sequencer_0c00:
 7787: 01 FF 03    ld   bc,$03FF
 778A: ED B0       ldir
 778C: C9          ret
+
+;----------------------------------------------------------------------------
+; Palette upload request for the ending ($5BB0 -> $D220, 32 bytes).
+;----------------------------------------------------------------------------
+ending_palette_setup_778d:
 778D: 21 FF 20    ld   hl,$20FF
-7790: 22 1F 84    ld   ($841F),hl
+7790: 22 1F 84    ld   (palette_upload_841f),hl
 7793: 21 20 D2    ld   hl,$D220
 7796: 22 21 84    ld   ($8421),hl
 7799: 21 B0 5B    ld   hl,$5BB0
 779C: 22 23 84    ld   ($8423),hl
 779F: C9          ret
+
+;----------------------------------------------------------------------------
+; === TASK $45 : keeps the 2 halves of the player sprite aligned ===
+;----------------------------------------------------------------------------
+task45_s4_sprite_align_77a0:
 77A0: 3E 01       ld   a,$01
-77A2: F7          rst  $30
-77A3: DD 21 BB 83 ld   ix,$83BB
+77A2: F7          rst  $30                  ; SLEEP 1 frame (yield)
+77A3: DD 21 BB 83 ld   ix,sprite_shadow_83bb
 77A7: DD 7E 21    ld   a,(ix+$21)
 77AA: D6 00       sub  $00
 77AC: F2 B1 77    jp   p,$77B1
 77AF: ED 44       neg
 77B1: FE 05       cp   $05
-77B3: DA A0 77    jp   c,$77A0
+77B3: DA A0 77    jp   c,task45_s4_sprite_align_77a0
 77B6: 3A D7 84    ld   a,($84D7)
 77B9: A7          and  a
 77BA: C2 D8 77    jp   nz,$77D8
@@ -8720,18 +10072,18 @@ music_sequencer_0c00:
 77C3: F2 C8 77    jp   p,$77C8
 77C6: ED 44       neg
 77C8: FE 0E       cp   $0E
-77CA: D2 A0 77    jp   nc,$77A0
+77CA: D2 A0 77    jp   nc,task45_s4_sprite_align_77a0
 77CD: DD 7E 21    ld   a,(ix+$21)
 77D0: C6 10       add  a,$10
 77D2: DD 77 25    ld   (ix+$25),a
-77D5: C3 A0 77    jp   $77A0
+77D5: C3 A0 77    jp   task45_s4_sprite_align_77a0
 77D8: DD 7E 20    ld   a,(ix+$20)
 77DB: DD 96 24    sub  (ix+$24)
 77DE: F2 E3 77    jp   p,$77E3
 77E1: ED 44       neg
 77E3: FE 0E       cp   $0E
-77E5: D2 A0 77    jp   nc,$77A0
+77E5: D2 A0 77    jp   nc,task45_s4_sprite_align_77a0
 77E8: DD 7E 20    ld   a,(ix+$20)
 77EB: C6 10       add  a,$10
 77ED: DD 77 24    ld   (ix+$24),a
-77F0: C3 A0 77    jp   $77A0
+77F0: C3 A0 77    jp   task45_s4_sprite_align_77a0
